@@ -1,0 +1,29 @@
+[project]
+name = "blaze"
+version = "0.1.0"
+description = "Blackwell-native LLM inference kernels for NVIDIA B200"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.5.0",
+    "safetensors>=0.4.0",
+    "sentencepiece>=0.2.0",
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "triton>=3.0",  # benchmarking harness only
+]
+quantize = [
+    "transformers>=4.40.0",
+    "datasets>=2.18.0",
+    "accelerate>=0.30.0",
+]
+
+[project.scripts]
+blaze = "run:main"
+
+[build-system]
+requires = ["setuptools>=68.0", "cmake>=3.24", "pybind11>=2.11"]
+build-backend = "setuptools.build_meta"

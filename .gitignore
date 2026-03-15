@@ -1,0 +1,27 @@
+# Build
+build/
+profiles/
+
+# OS
+.DS_Store
+Thumbs.db
+.vscode/
+.claude/
+.idea/
+*.swp
+*.swo
+*~
+*.md
+!README.md
+!docs/**/*.md
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+
+# CUDA
+*.o
+*.cubin
+*.fatbin
