@@ -41,7 +41,7 @@ A production serving engine. There's no batching, no paged KV-cache, no HTTP ser
 ## Build
 
 ```bash
-cmake -B build -DCMAKE_CUDA_ARCHITECTURES=100 -DCMAKE_BUILD_TYPE=Release
+cmake -B build -DCMAKE_CUDA_ARCHITECTURES=100a -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 ```
 
@@ -49,8 +49,10 @@ cmake --build build -j$(nproc)
 
 **Work in progress.** Building out kernel implementations phase by phase.
 
-- [ ] Phase 0 — `tcgen05` bringup and TMEM lifecycle validation
-- [ ] Phase 1 — FP8/FP4/mixed GEMM kernels 
+- [x] Phase 0 — `tcgen05` bringup and TMEM lifecycle validation ([report](docs/phase0.md))
+  - TMEM alloc/dealloc verified on B200, naive FP16 GEMM correctness validated against cuBLAS 
+  - Profiled with Nsight Compute: cuBLAS achieves 76% TC pipe utilization, 1520× fewer instructions than CUDA-core baseline
+- [ ] Phase 1 — FP8/FP4/mixed GEMM kernels
 - [ ] Phase 2 — Fused prefill and decode attention
 - [ ] Phase 3 — NVFP4 quantization pipeline
 - [ ] Phase 4 — End-to-end Llama-7B generation
@@ -62,5 +64,7 @@ cmake --build build -j$(nproc)
 - [Reverse-engineering FA4](https://modal.com/blog/reverse-engineer-flash-attention-4) — Pipeline breakdown of the FA4 kernel
 - [Microbenchmarking Blackwell](https://arxiv.org/abs/2512.02189) — First systematic characterization of B200 (TMEM, DE, tcgen05)
 - [FP4 MoE kernel engineering](https://huggingface.co/blog/apsys/blackwell-nvfp4-comparison) — Practical NVFP4 optimization on B200
+- [NVIDIA PTX ISA](https://docs.nvidia.com/cuda/parallel-thread-execution/) — Authoritative reference for `tcgen05` instruction semantics
+- [CUTLASS](https://github.com/NVIDIA/cutlass) — NVIDIA's open-source GEMM template library (cuBLAS dispatches CUTLASS SM100 kernels on B200)
 - [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) — Reference tcgen05 kernel structure
 
