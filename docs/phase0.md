@@ -21,6 +21,14 @@ Phase 0 answers two questions:
 
 Build target: `sm_100a` (the `a` suffix enables architecture-accelerated features: `tcgen05`, TMEM, TMA).
 
+### Build
+
+```bash
+mkdir -p build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=100a
+make -j$(nproc)
+```
+
 ---
 
 ## Experiment 1: TMEM Lifecycle (`hello_tcgen05`)
@@ -72,6 +80,12 @@ __global__ void kernel_hello_tcgen05(float* output) {
 
 The kernel is launched via `cudaLaunchKernelEx` with explicit cluster dimensions — `tcgen05` instructions require the cluster scheduling infrastructure even for single-CTA operations.
 
+### Run
+
+```bash
+./build/hello_tcgen05
+```
+
 ### Results
 
 ```
@@ -90,6 +104,10 @@ Results:
 TMEM address `0x00000000` is valid — it's the base of the TMEM address space.
 
 ### Nsight Compute Profile
+
+```bash
+./scripts/profile.sh tmem ./build/hello_tcgen05
+```
 
 ```
 Metric                                                             Value
@@ -170,6 +188,12 @@ cublasHgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
             &beta, d_C_ref, N);
 ```
 
+### Run
+
+```bash
+./build/gemm_fp16_naive
+```
+
 ### Correctness Results
 
 ```
@@ -197,6 +221,10 @@ Mean relative error of 0.4% confirms correctness. The max relative error (31.7%)
 The relative error metric uses `max(|ref|, |test|, 1.0)` as the denominator to avoid pathological inflation from near-zero values.
 
 ### Nsight Compute: Targeted Pipeline Metrics
+
+```bash
+./scripts/profile.sh tmem ./build/gemm_fp16_naive
+```
 
 **Our naive kernel:**
 
@@ -233,6 +261,10 @@ sm__warps_active.avg.pct_of_peak_sustained_elapsed                      8.14%
 
 ### Nsight Compute: Full Kernel Analysis (`--set full`)
 
+```bash
+./scripts/profile.sh ncu ./build/gemm_fp16_naive
+```
+
 The full profile (40 replay passes) reveals deeper architectural details.
 
 **cuBLAS:**
@@ -253,7 +285,7 @@ The full profile (40 replay passes) reveals deeper architectural details.
 | Occupancy | Theoretical / Achieved | 12.50% / 9.88% |
 | Occupancy | Limiter: shared memory | 1 block/SM |
 
-**Our naive kernel (warm run):**
+**Our naive kernel:**
 
 | Category | Metric | Value |
 |----------|--------|-------|
@@ -273,7 +305,7 @@ The full profile (40 replay passes) reveals deeper architectural details.
 
 ### Profile Analysis
 
-| Metric | Naive GEMM (warm) | cuBLAS | Ratio |
+| Metric | Naive GEMM | cuBLAS | Ratio |
 |--------|-----------|--------|-------|
 | Duration | 16.91 ms | 178.40 µs | 95× |
 | Instructions executed | 6.0 billion | 3.9 million | 1520× |
