@@ -2,20 +2,28 @@
 /**
  * mixed_gemm_sm100.cuh — Mixed-precision GEMM for SM100 (Blackwell).
  *
- * The actual inference kernel: FP16/BF16 activations × FP4 weights.
- *   A (activations): FP16/BF16, dynamic per-token values
- *   B (weights):     NVFP4 (E2M1 + block scales + tensor scale)
- *   Accumulator:     FP32 in TMEM
- *   Output:          FP16/BF16
+ * Primary inference kernel: FP16 activations × NVFP4 weights.
+ * The host launch converts FP16 activations to E4M3, then the kernel
+ * computes C[M,N] = A_e4m3[M,K] × B_fp4[K,N] via tcgen05.mma.kind::f8f6f4.
  *
- * This is the most important kernel — it's called for every linear layer
- * during both prefill and decode.
+ *   A (activations): FP16 at API boundary, E4M3 inside kernel
+ *   B (weights):     NVFP4 (E2M1 data + E4M3 block scales + FP32 tensor scale)
+ *   Accumulator:     FP32 in TMEM
+ *   Output:          FP16
+ *
+ * Warp-specialized, 2-stage double-buffered pipeline:
+ *   Warp 0: MMA consumer  (tcgen05.mma, E4M3 × E2M1)
+ *   Warp 1: TMA producer  (packed data via TMA, scales via global loads)
+ *   Warp 2: Idle
+ *   Warp 3: Epilogue      (TMEM → SMEM → global store with tensor scale)
+ *
+ * Tile: 128×128×64 (M×N×K). K_PER_MMA=32, 2 inner iterations per tile.
  */
 
 #include "gemm/fp4_gemm_sm100.cuh"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
-#include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cstdint>
 
 namespace blaze {
@@ -23,19 +31,18 @@ namespace blaze {
 struct MixedGemmConfig {
     static constexpr int TILE_M = 128;
     static constexpr int TILE_N = 128;
-    static constexpr int TILE_K = 64;   // K in FP16 elements (matched to weight FP4 K/2 bytes)
-    static constexpr int BLOCK_SIZE = 128;
+    static constexpr int TILE_K = 64;
+    static constexpr int BLOCK_SIZE = 128;         // 4 warps
     static constexpr int PIPELINE_STAGES = 2;
 
-    // A (activations): FP16, (TILE_M × TILE_K) elements
-    static constexpr int SMEM_A_BYTES = TILE_M * TILE_K * sizeof(half);  // 16 KB
+    // Per-stage SMEM for A (E4M3 activations, 1 byte each)
+    static constexpr int SMEM_A_BYTES = TILE_M * TILE_K;                       // 8 KB
 
-    // B (weights): FP4 packed + block scales
-    static constexpr int SMEM_B_DATA_BYTES = TILE_K * TILE_N / 2;       // 4 KB (FP4 packed)
-    static constexpr int SMEM_B_SCALE_BYTES =
-        (TILE_K * TILE_N / FP4_BLOCK_SIZE) * sizeof(__nv_fp8_e4m3);     // scales
+    // Per-stage SMEM for B packed data + block scales
+    static constexpr int SMEM_B_DATA_BYTES  = TILE_K * TILE_N / 2;            // 4 KB
+    static constexpr int SMEM_B_SCALE_BYTES = TILE_K * (TILE_N / FP4_BLOCK_SIZE);  // 512
 
-    static constexpr int SMEM_C_BYTES = TILE_M * TILE_N * sizeof(float); // 64 KB
+    static constexpr int SMEM_C_BYTES = TILE_M * TILE_N * sizeof(float);       // 64 KB
 
     static constexpr int TOTAL_SMEM_BYTES =
         PIPELINE_STAGES * (SMEM_A_BYTES + SMEM_B_DATA_BYTES + SMEM_B_SCALE_BYTES) +

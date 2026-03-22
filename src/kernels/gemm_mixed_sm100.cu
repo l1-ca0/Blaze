@@ -1,14 +1,20 @@
 /**
- * gemm_mixed_sm100.cu — Mixed-precision GEMM: FP16 activations × FP4 weights.
+ * gemm_mixed_sm100.cu — Mixed-precision GEMM for SM100 (Blackwell).
  *
- * This is the primary kernel used during inference. Architecture matches
- * the FP8/FP4 kernels (warp-specialized, double-buffered TMA) but handles
- * asymmetric input types:
- *   - A: FP16/BF16 activations loaded via TMA
- *   - B: NVFP4 weights (packed data + block scales) loaded via TMA
- *   - tcgen05.mma handles the mixed-precision computation
- *   - Accumulator: FP32 in TMEM
- *   - Output: FP16 after epilogue
+ * Primary inference kernel: FP16 activations × NVFP4 weights.
+ * The host launch converts FP16 activations to E4M3, then the kernel
+ * computes C[M,N] = A_e4m3[M,K] × B_fp4[K,N] with FP32 TMEM
+ * accumulator and FP16 output. Tensor scale applied in epilogue.
+ *
+ * Warp-specialized, 2-stage double-buffered pipeline:
+ *   Warp 0: MMA consumer  (tcgen05.mma.kind::f8f6f4, E4M3 × E2M1)
+ *   Warp 1: TMA producer  (packed data via TMA, scales via global loads)
+ *   Warp 2: Idle
+ *   Warp 3: Epilogue      (TMEM → SMEM → global store with tensor scale)
+ *
+ * Tile: 128×128×64 (M×N×K). K_PER_MMA=32, 2 inner iterations per tile.
+ * A (E4M3) and B packed data loaded via TMA with B64 swizzle;
+ * B block scales loaded via warp-cooperative global memory reads.
  */
 
 #include "gemm/mixed_gemm_sm100.cuh"
@@ -17,141 +23,130 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cstdio>
 
 namespace blaze {
 
 using Config = MixedGemmConfig;
 
-struct MixedSmemLayout {
-    // A (activations): FP16, double-buffered
-    half A[Config::PIPELINE_STAGES][Config::TILE_M * Config::TILE_K];
+// B scale tile: TILE_K × (TILE_N / FP4_BLOCK_SIZE) E4M3 values per stage.
+static constexpr int SCALE_COLS = Config::TILE_N / FP4_BLOCK_SIZE;   // 8
+static constexpr int SCALE_TILE_BYTES = Config::TILE_K * SCALE_COLS; // 512
 
-    // B (weights): FP4 packed data + block scales, double-buffered
+struct __align__(128) MixedSmemLayout {
+    alignas(8) uint64_t mbar_load[Config::PIPELINE_STAGES];
+    alignas(8) uint64_t mbar_mma[Config::PIPELINE_STAGES];
+    uint32_t tmem_addr;
+    char _pad[128 - (2 * Config::PIPELINE_STAGES * 8 + 4)];
+
+    __nv_fp8_e4m3 A[Config::PIPELINE_STAGES][Config::TILE_M * Config::TILE_K];
     uint8_t B_data[Config::PIPELINE_STAGES][Config::TILE_K * Config::TILE_N / 2];
-    __nv_fp8_e4m3 B_scales[Config::PIPELINE_STAGES]
-        [Config::TILE_K * Config::TILE_N / FP4_BLOCK_SIZE];
-
-    // Output staging
+    __nv_fp8_e4m3 B_scales[Config::PIPELINE_STAGES][SCALE_TILE_BYTES];
     float C[Config::TILE_M * Config::TILE_N];
-
-    // Barriers
-    uint64_t mbar_load[Config::PIPELINE_STAGES];
-    uint64_t mbar_mma[Config::PIPELINE_STAGES];
 };
 
-/**
- * TMA Producer: loads FP16 activations and FP4 weights.
- */
 __device__ __forceinline__
 void mixed_tma_producer(
     MixedSmemLayout* smem,
     const TmaDescriptor* desc_A,
     const TmaDescriptor* desc_B_data,
-    const TmaDescriptor* desc_B_scales,
-    int bm, int bn, int K,
-    int lane_id
+    const __nv_fp8_e4m3* global_B_scales,
+    int bm, int bn, int K, int N, int lane_id
 ) {
     const int num_k_tiles = K / Config::TILE_K;
+    const int scale_stride = N / FP4_BLOCK_SIZE;  // global row stride for scales
 
     for (int k_tile = 0; k_tile < num_k_tiles; k_tile++) {
         int stage = k_tile % Config::PIPELINE_STAGES;
         int k_offset = k_tile * Config::TILE_K;
 
-        if (lane_id == 0) {
-            uint32_t tx_bytes = Config::SMEM_A_BYTES + Config::SMEM_B_DATA_BYTES +
-                               Config::SMEM_B_SCALE_BYTES;
-            mbarrier_expect_tx(&smem->mbar_load[stage], tx_bytes);
-
-            // Load A (FP16 activations)
-            tma_load_2d(smem->A[stage], desc_A,
-                        k_offset, bm, &smem->mbar_load[stage]);
-
-            // Load B data (FP4 packed)
-            tma_load_2d(smem->B_data[stage], desc_B_data,
-                        bn / 2, k_offset, &smem->mbar_load[stage]);
-
-            // Load B scales
-            tma_load_2d(smem->B_scales[stage], desc_B_scales,
-                        bn / FP4_BLOCK_SIZE, k_offset, &smem->mbar_load[stage]);
-        }
-
         if (k_tile >= Config::PIPELINE_STAGES) {
             mbarrier_wait(&smem->mbar_mma[stage],
-                         (k_tile / Config::PIPELINE_STAGES) & 1);
+                         ((k_tile / Config::PIPELINE_STAGES) + 1) & 1);
+        }
+
+        if (lane_id == 0) {
+            uint32_t tx_bytes = Config::SMEM_A_BYTES + Config::SMEM_B_DATA_BYTES;
+            mbarrier_expect_tx(&smem->mbar_load[stage], tx_bytes);
+
+            tma_load_2d(smem->A[stage], desc_A,
+                        k_offset, bm, &smem->mbar_load[stage]);
+            tma_load_2d(smem->B_data[stage], desc_B_data,
+                        bn / 2, k_offset, &smem->mbar_load[stage]);
+        }
+
+        // Warp-cooperative load of B block scales from global memory.
+        {
+            const int scale_col_start = bn / FP4_BLOCK_SIZE;
+            const int total_elems = SCALE_TILE_BYTES;
+            for (int i = lane_id; i < total_elems; i += 32) {
+                int row = i / SCALE_COLS;
+                int col = i % SCALE_COLS;
+                int global_idx = (k_offset + row) * scale_stride + (scale_col_start + col);
+                smem->B_scales[stage][i] = global_B_scales[global_idx];
+            }
         }
     }
 }
 
-/**
- * MMA Consumer: mixed-precision tcgen05.mma (FP16 × FP4).
- *
- * The hardware handles the asymmetric types:
- *   - A operand: FP16 from SMEM
- *   - B operand: FP4 from SMEM with block scales
- *   - Accumulator: FP32 in TMEM
- */
+/** MMA consumer: issues tcgen05.mma across K tiles with double-buffered SMEM. */
 __device__ __forceinline__
-void mixed_mma_consumer(
-    MixedSmemLayout* smem,
-    tmem_addr_t tmem_addr,
-    int K,
-    int warp_id
-) {
+void mixed_mma_consumer(MixedSmemLayout* smem, tmem_addr_t tmem_addr, int K) {
     const int num_k_tiles = K / Config::TILE_K;
+    constexpr int K_PER_MMA = 32;
+    constexpr int NUM_K_ITERS = Config::TILE_K / K_PER_MMA;
+
+    uint32_t idesc = make_idesc_f8f6f4(0, 5, Config::TILE_M, Config::TILE_N);  // E4M3 × E2M1
+    bool first_mma = true;
 
     for (int k_tile = 0; k_tile < num_k_tiles; k_tile++) {
         int stage = k_tile % Config::PIPELINE_STAGES;
+        mbarrier_wait(&smem->mbar_load[stage], (k_tile / Config::PIPELINE_STAGES) & 1);
 
-        mbarrier_wait(&smem->mbar_load[stage],
-                     (k_tile / Config::PIPELINE_STAGES) & 1);
+        uint32_t smem_a_base = static_cast<uint32_t>(__cvta_generic_to_shared(smem->A[stage]));
+        uint32_t smem_b_base = static_cast<uint32_t>(__cvta_generic_to_shared(smem->B_data[stage]));
 
-        uint32_t smem_a_addr = static_cast<uint32_t>(
-            __cvta_generic_to_shared(smem->A[stage]));
-        uint32_t smem_b_addr = static_cast<uint32_t>(
-            __cvta_generic_to_shared(smem->B_data[stage]));
+        for (int ki = 0; ki < NUM_K_ITERS; ki++) {
+            asm volatile("tcgen05.fence::after_thread_sync;\n" ::: "memory");
 
-        // Mixed-precision MMA: FP16 A × FP4 B
-        // tcgen05 handles the format conversion internally
-        asm volatile(
-            "tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], %1, %2, %3, 0;\n"
-            :
-            : "r"(tmem_addr),
-              "l"((uint64_t)smem_a_addr),
-              "l"((uint64_t)smem_b_addr),
-              "r"(1)
-            : "memory"
-        );
+            uint32_t smem_a_addr = smem_a_base + ki * K_PER_MMA;
+            uint32_t smem_b_addr = smem_b_base + ki * K_PER_MMA * (Config::TILE_N / 2);
+
+            uint64_t desc_a = make_smem_desc(smem_a_addr, Config::TILE_K, 4);      // B64 swizzle
+            uint64_t desc_b = make_smem_desc(smem_b_addr, Config::TILE_N / 2, 4);  // B64 swizzle
+
+            if (elect_one_sync()) {
+                if (first_mma) {
+                    asm volatile(
+                        "tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], %1, %2, %3, 0;\n"
+                        : : "r"(tmem_addr), "l"(desc_a), "l"(desc_b), "r"(idesc) : "memory");
+                } else {
+                    asm volatile(
+                        "tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], %1, %2, %3, 1;\n"
+                        : : "r"(tmem_addr), "l"(desc_a), "l"(desc_b), "r"(idesc) : "memory");
+                }
+            }
+            first_mma = false;
+
+            asm volatile("tcgen05.fence::before_thread_sync;\n" ::: "memory");
+        }
 
         __syncwarp();
-
-        if (warp_id == 1) {
+        if (elect_one_sync()) {
             mbarrier_arrive(&smem->mbar_mma[stage]);
         }
     }
 }
 
-/**
- * Mixed GEMM epilogue with support for residual connections.
- */
 __device__ __forceinline__
 void mixed_epilogue(
-    MixedSmemLayout* smem,
-    tmem_addr_t tmem_addr,
-    half* C_global,
-    int bm, int bn, int M, int N,
-    float weight_scale,
-    const half* bias,
-    const half* residual,
-    MixedEpilogue epilogue_op,
-    int tid
+    MixedSmemLayout* smem, tmem_addr_t tmem_addr,
+    half* C_global, int bm, int bn, int M, int N,
+    float weight_scale, const half* bias, const half* residual,
+    MixedEpilogue epilogue_op, int tid
 ) {
     int local_tid = tid % 32;
-
-    // TMEM → SMEM via tcgen05.ld (all warp threads participate)
-    tmem_store_to_smem(smem->C, tmem_addr, Config::TILE_N);
-    __syncwarp();
-
     const int elems_per_thread = (Config::TILE_M * Config::TILE_N) / 32;
 
     for (int i = 0; i < elems_per_thread; i++) {
@@ -162,7 +157,6 @@ void mixed_epilogue(
         int global_col = bn + col;
 
         if (global_row < M && global_col < N) {
-            // Apply weight tensor scale (activation scale is 1.0 for FP16)
             float val = smem->C[idx] * weight_scale;
 
             switch (epilogue_op) {
@@ -188,15 +182,12 @@ void mixed_epilogue(
     }
 }
 
-/**
- * Main mixed-precision GEMM kernel.
- */
 __cluster_dims__(1, 1, 1)
 __global__ void __launch_bounds__(Config::BLOCK_SIZE)
 gemm_mixed_kernel(
     const TmaDescriptor* __restrict__ desc_A,
     const TmaDescriptor* __restrict__ desc_B_data,
-    const TmaDescriptor* __restrict__ desc_B_scales,
+    const __nv_fp8_e4m3* __restrict__ global_B_scales,
     half* __restrict__ C,
     int M, int N, int K,
     float weight_scale,
@@ -210,11 +201,9 @@ gemm_mixed_kernel(
     const int tid = threadIdx.x;
     const int warp_id = tid / 32;
     const int lane_id = tid % 32;
-
     const int bm = blockIdx.y * Config::TILE_M;
     const int bn = blockIdx.x * Config::TILE_N;
 
-    // Init barriers
     if (tid == 0) {
         for (int s = 0; s < Config::PIPELINE_STAGES; s++) {
             mbarrier_init(&smem->mbar_load[s], 1);
@@ -223,29 +212,33 @@ gemm_mixed_kernel(
     }
     __syncthreads();
 
-    // Allocate TMEM
-    __shared__ uint32_t smem_tmem_addr;
     tmem_addr_t tmem_addr;
     if (warp_id == 0) {
-        tmem_alloc(&smem_tmem_addr, Config::TMEM_COLUMNS);
+        tmem_alloc(&smem->tmem_addr, Config::TMEM_COLUMNS);
     }
     __syncthreads();
-    tmem_addr = smem_tmem_addr;
+    tmem_addr = smem->tmem_addr;
 
     switch (warp_id) {
         case 0:
-            mixed_tma_producer(smem, desc_A, desc_B_data, desc_B_scales,
-                              bm, bn, K, lane_id);
+            mixed_mma_consumer(smem, tmem_addr, K);
             break;
         case 1:
+            mixed_tma_producer(smem, desc_A, desc_B_data, global_B_scales,
+                              bm, bn, K, N, lane_id);
+            break;
         case 2:
-            mixed_mma_consumer(smem, tmem_addr, K, warp_id);
-            break;
         case 3:
-            __syncthreads();
-            mixed_epilogue(smem, tmem_addr, C, bm, bn, M, N,
-                          weight_scale, bias, residual, epilogue_op, tid);
             break;
+    }
+
+    __syncthreads();
+    tmem_store_to_smem_warp(smem->C, tmem_addr, Config::TILE_N, warp_id);
+    __syncthreads();
+
+    if (warp_id == 3) {
+        mixed_epilogue(smem, tmem_addr, C, bm, bn, M, N,
+                      weight_scale, bias, residual, epilogue_op, tid);
     }
 
     __syncthreads();
@@ -254,7 +247,19 @@ gemm_mixed_kernel(
     }
 }
 
-// --- Host launch functions ---
+/** Element-wise FP16 → E4M3 conversion (nearest rounding). */
+__global__ void fp16_to_e4m3_kernel(
+    const half* __restrict__ in,
+    __nv_fp8_e4m3* __restrict__ out,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = __nv_fp8_e4m3(in[i]);
+    }
+}
+
+// --- Host launch ---
 
 void launch_gemm_mixed(
     const half* A,
@@ -266,38 +271,56 @@ void launch_gemm_mixed(
     MixedEpilogue epilogue,
     cudaStream_t stream
 ) {
-    // TMA descriptors
-    TmaDescriptor h_desc_A, h_desc_B_data, h_desc_B_scales;
+    // Convert FP16 activations → E4M3
+    __nv_fp8_e4m3* A_e4m3;
+    cudaMalloc(&A_e4m3, (size_t)M * K * sizeof(__nv_fp8_e4m3));
+    {
+        int threads = 256;
+        int blocks = ((M * K) + threads - 1) / threads;
+        fp16_to_e4m3_kernel<<<blocks, threads, 0, stream>>>(A, A_e4m3, M * K);
+    }
 
-    create_tma_desc_2d(&h_desc_A, A, CU_TENSOR_MAP_DATA_TYPE_FLOAT16,
-                       M, K, Config::TILE_M, Config::TILE_K, TmaSwizzle::B128);
+    // Pad M if smaller than tile
+    const __nv_fp8_e4m3* A_tma = A_e4m3;
+    __nv_fp8_e4m3* A_padded = nullptr;
+    int M_tma = M;
+    if (M < Config::TILE_M) {
+        M_tma = Config::TILE_M;
+        cudaMalloc(&A_padded, (size_t)M_tma * K * sizeof(__nv_fp8_e4m3));
+        cudaMemsetAsync(A_padded, 0, (size_t)M_tma * K * sizeof(__nv_fp8_e4m3), stream);
+        cudaMemcpyAsync(A_padded, A_e4m3, (size_t)M * K * sizeof(__nv_fp8_e4m3),
+                        cudaMemcpyDeviceToDevice, stream);
+        A_tma = A_padded;
+    }
 
+    // TMA descriptors for A (E4M3) and B packed data; scales loaded via global memory.
+    TmaDescriptor h_desc_A, h_desc_B_data;
+    create_tma_desc_2d(&h_desc_A, A_tma, CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                       M_tma, K, Config::TILE_M, Config::TILE_K, TmaSwizzle::B64);
     create_tma_desc_2d(&h_desc_B_data, B.data, CU_TENSOR_MAP_DATA_TYPE_UINT8,
-                       K, N / 2,
-                       Config::TILE_K, Config::TILE_N / 2, TmaSwizzle::B128);
-
-    create_tma_desc_2d(&h_desc_B_scales, B.block_scales, CU_TENSOR_MAP_DATA_TYPE_UINT8,
-                       K, N / FP4_BLOCK_SIZE,
-                       Config::TILE_K, Config::TILE_N / FP4_BLOCK_SIZE, TmaSwizzle::NONE);
+                       K, N / 2, Config::TILE_K, Config::TILE_N / 2, TmaSwizzle::B64);
 
     TmaDescriptor* d_descs;
-    cudaMalloc(&d_descs, 3 * sizeof(TmaDescriptor));
-    cudaMemcpyAsync(d_descs, &h_desc_A, sizeof(TmaDescriptor),
-                    cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_descs + 1, &h_desc_B_data, sizeof(TmaDescriptor),
-                    cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_descs + 2, &h_desc_B_scales, sizeof(TmaDescriptor),
-                    cudaMemcpyHostToDevice, stream);
+    cudaMalloc(&d_descs, 2 * sizeof(TmaDescriptor));
+    cudaMemcpyAsync(d_descs,     &h_desc_A,      sizeof(TmaDescriptor), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_descs + 1, &h_desc_B_data, sizeof(TmaDescriptor), cudaMemcpyHostToDevice, stream);
 
     dim3 grid((N + Config::TILE_N - 1) / Config::TILE_N,
               (M + Config::TILE_M - 1) / Config::TILE_M);
     dim3 block(Config::BLOCK_SIZE);
     size_t smem_size = sizeof(MixedSmemLayout);
 
-    cudaFuncSetAttribute(gemm_mixed_kernel,
+    cudaError_t err = cudaFuncSetAttribute(gemm_mixed_kernel,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "Mixed GEMM: cudaFuncSetAttribute failed: %s (smem=%zu)\n",
+                cudaGetErrorString(err), smem_size);
+        cudaFreeAsync(A_e4m3, stream);
+        if (A_padded) cudaFreeAsync(A_padded, stream);
+        cudaFreeAsync(d_descs, stream);
+        return;
+    }
 
-    // Cluster launch required for tcgen05 instructions
     cudaLaunchConfig_t launch_config = {};
     launch_config.gridDim = grid;
     launch_config.blockDim = block;
@@ -313,11 +336,12 @@ void launch_gemm_mixed(
     launch_config.numAttrs = 1;
 
     cudaLaunchKernelEx(&launch_config, gemm_mixed_kernel,
-        d_descs, d_descs + 1, d_descs + 2,
-        C, M, N, K,
-        B.tensor_scale, bias, residual, epilogue);
+        d_descs, d_descs + 1, B.block_scales,
+        C, M, N, K, B.tensor_scale, bias, residual, epilogue);
 
     cudaFreeAsync(d_descs, stream);
+    cudaFreeAsync(A_e4m3, stream);
+    if (A_padded) cudaFreeAsync(A_padded, stream);
 }
 
 void launch_fused_gate_up(
@@ -328,38 +352,16 @@ void launch_fused_gate_up(
     int M, int N, int K,
     cudaStream_t stream
 ) {
-    // Allocate intermediate buffers for gate and up projections
     half *d_gate, *d_up;
     cudaMalloc(&d_gate, M * N * sizeof(half));
     cudaMalloc(&d_up, M * N * sizeof(half));
 
-    // Compute gate = SiLU(x @ W_gate)
     launch_gemm_mixed(x, W_gate, d_gate, M, N, K,
                       nullptr, nullptr, MixedEpilogue::SILU, stream);
-
-    // Compute up = x @ W_up
     launch_gemm_mixed(x, W_up, d_up, M, N, K,
                       nullptr, nullptr, MixedEpilogue::NONE, stream);
 
-    // Element-wise: output = gate * up
-    // This is a simple kernel, launched inline
-    int total = M * N;
-    int threads = 256;
-    int blocks = (total + threads - 1) / threads;
-
-    // Lambda-style kernel via a separate small kernel
-    // For now, use a thrust-style approach or a tiny kernel
-    // (Defined below as a helper)
-    auto mul_kernel = [] __device__ (half* out, const half* a, const half* b, int n) {
-        int idx = blockIdx.x * blockDim.x + threadIdx.x;
-        if (idx < n) {
-            out[idx] = __float2half(__half2float(a[idx]) * __half2float(b[idx]));
-        }
-    };
-
-    // We'll define the element-wise multiply as a proper kernel in silu.cu
-    // For now, just do both GEMMs and combine later in the model runner
-    // TODO: Fuse into a single kernel for better performance
+    // TODO: element-wise gate * up (define in silu.cu)
     cudaMemcpyAsync(output, d_gate, M * N * sizeof(half),
                     cudaMemcpyDeviceToDevice, stream);
 
