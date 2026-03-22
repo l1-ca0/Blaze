@@ -1,8 +1,10 @@
 /**
- * test_gemm.cu — Correctness tests for Phase 1 production GEMM kernels.
+ * test_gemm.cu — Correctness tests for Phase 1 GEMM kernels.
  *
- * Tests FP8, FP4, and mixed-precision GEMM kernels against cuBLAS reference
- * on all Llama-7B matrix shapes.
+ * Validates FP8, mixed-precision (FP16×FP4), and FP4 GEMM kernels
+ * across all Llama-7B projection shapes. Each test checks for NaN/Inf
+ * in the output as a basic sanity gate. Numerical accuracy tests
+ * against cuBLAS will be added once the kernels produce correct results.
  */
 
 #include "gemm/fp8_gemm_sm100.cuh"
@@ -27,14 +29,17 @@
         }                                                                      \
     } while (0)
 
-// Llama-7B matrix shapes: (M, N, K, description)
+// ---------------------------------------------------------------------------
+// Llama-7B matrix shapes covering decode (M=1), batched, and prefill sizes.
+// ---------------------------------------------------------------------------
+
 struct GemmTestCase {
     int M, N, K;
     const char* name;
 };
 
 static GemmTestCase llama_shapes[] = {
-    // Decode shapes (M=1)
+    // Decode (M=1)
     {1,     12288, 4096,  "decode_QKV"},
     {1,     4096,  4096,  "decode_out_proj"},
     {1,     22016, 4096,  "decode_FFN_gate_up"},
@@ -51,7 +56,10 @@ static GemmTestCase llama_shapes[] = {
     {2048,  4096,  11008, "prefill2048_FFN_down"},
 };
 
-// Initialize FP8 E4M3 tensor with random values
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
 void init_random_fp8(void* data, int size, unsigned seed) {
     srand(seed);
     auto* ptr = static_cast<__nv_fp8_e4m3*>(data);
@@ -61,7 +69,6 @@ void init_random_fp8(void* data, int size, unsigned seed) {
     }
 }
 
-// Initialize FP16 tensor with random values
 void init_random_fp16(half* data, int size, unsigned seed) {
     srand(seed);
     for (int i = 0; i < size; i++) {
@@ -70,7 +77,6 @@ void init_random_fp16(half* data, int size, unsigned seed) {
     }
 }
 
-// Compute max and mean relative error
 struct ErrorStats {
     float max_rel;
     float mean_rel;
@@ -89,10 +95,20 @@ ErrorStats compute_error(const half* ref, const half* test, int size) {
     return {max_err, static_cast<float>(sum_err / size)};
 }
 
-// ============== FP8 GEMM Tests ==============
+bool check_no_nan_inf(const half* data, int size) {
+    for (int i = 0; i < size; i++) {
+        float v = __half2float(data[i]);
+        if (isnan(v) || isinf(v)) return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// FP8 GEMM: E4M3 × E4M3 → FP16
+// ---------------------------------------------------------------------------
 
 int test_fp8_gemm(cublasHandle_t cublas) {
-    printf("\n=== FP8 GEMM Tests ===\n");
+    printf("\n=== FP8 GEMM Tests (E4M3 x E4M3) ===\n");
     int passed = 0;
     int total = sizeof(llama_shapes) / sizeof(llama_shapes[0]);
 
@@ -101,16 +117,13 @@ int test_fp8_gemm(cublasHandle_t cublas) {
         printf("  [%d/%d] %s (M=%d, N=%d, K=%d)... ",
                t + 1, total, tc.name, tc.M, tc.N, tc.K);
 
-        // Allocate and init FP8 inputs
         __nv_fp8_e4m3 *d_A, *d_B;
-        half *d_C, *d_C_ref;
+        half *d_C;
 
         CHECK_CUDA(cudaMalloc(&d_A, tc.M * tc.K * sizeof(__nv_fp8_e4m3)));
         CHECK_CUDA(cudaMalloc(&d_B, tc.K * tc.N * sizeof(__nv_fp8_e4m3)));
         CHECK_CUDA(cudaMalloc(&d_C, tc.M * tc.N * sizeof(half)));
-        CHECK_CUDA(cudaMalloc(&d_C_ref, tc.M * tc.N * sizeof(half)));
 
-        // Init on host and copy
         auto* h_A = new __nv_fp8_e4m3[tc.M * tc.K];
         auto* h_B = new __nv_fp8_e4m3[tc.K * tc.N];
         init_random_fp8(h_A, tc.M * tc.K, 42);
@@ -121,27 +134,18 @@ int test_fp8_gemm(cublasHandle_t cublas) {
         CHECK_CUDA(cudaMemcpy(d_B, h_B, tc.K * tc.N * sizeof(__nv_fp8_e4m3),
                               cudaMemcpyHostToDevice));
 
-        // Run our kernel
         blaze::launch_gemm_fp8(d_A, d_B, d_C, tc.M, tc.N, tc.K);
         CHECK_CUDA(cudaDeviceSynchronize());
 
-        // Read back and check
         auto* h_C = new half[tc.M * tc.N];
         CHECK_CUDA(cudaMemcpy(h_C, d_C, tc.M * tc.N * sizeof(half),
                               cudaMemcpyDeviceToHost));
 
-        // Basic sanity: check for NaN/Inf
-        bool has_nan = false;
-        for (int i = 0; i < tc.M * tc.N; i++) {
-            float v = __half2float(h_C[i]);
-            if (isnan(v) || isinf(v)) { has_nan = true; break; }
-        }
-
-        if (has_nan) {
-            printf("FAIL (NaN/Inf in output)\n");
-        } else {
-            printf("PASS (no NaN/Inf)\n");
+        if (check_no_nan_inf(h_C, tc.M * tc.N)) {
+            printf("PASS\n");
             passed++;
+        } else {
+            printf("FAIL (NaN/Inf in output)\n");
         }
 
         delete[] h_A;
@@ -150,17 +154,18 @@ int test_fp8_gemm(cublasHandle_t cublas) {
         CHECK_CUDA(cudaFree(d_A));
         CHECK_CUDA(cudaFree(d_B));
         CHECK_CUDA(cudaFree(d_C));
-        CHECK_CUDA(cudaFree(d_C_ref));
     }
 
     printf("  FP8 GEMM: %d/%d passed\n", passed, total);
     return passed == total ? 0 : 1;
 }
 
-// ============== Mixed GEMM Tests ==============
+// ---------------------------------------------------------------------------
+// Mixed GEMM: FP16 activations × NVFP4 weights → FP16
+// ---------------------------------------------------------------------------
 
 int test_mixed_gemm(cublasHandle_t cublas) {
-    printf("\n=== Mixed-Precision GEMM Tests (FP16 × FP4) ===\n");
+    printf("\n=== Mixed GEMM Tests (FP16 x FP4) ===\n");
     int passed = 0;
     int total = sizeof(llama_shapes) / sizeof(llama_shapes[0]);
 
@@ -169,7 +174,6 @@ int test_mixed_gemm(cublasHandle_t cublas) {
         printf("  [%d/%d] %s (M=%d, N=%d, K=%d)... ",
                t + 1, total, tc.name, tc.M, tc.N, tc.K);
 
-        // Allocate FP16 activations
         half* d_A;
         CHECK_CUDA(cudaMalloc(&d_A, tc.M * tc.K * sizeof(half)));
 
@@ -178,7 +182,6 @@ int test_mixed_gemm(cublasHandle_t cublas) {
         CHECK_CUDA(cudaMemcpy(d_A, h_A, tc.M * tc.K * sizeof(half),
                               cudaMemcpyHostToDevice));
 
-        // Allocate FP4 weights (dummy for now)
         int data_bytes = tc.K * tc.N / 2;
         int scale_count = tc.K * tc.N / blaze::FP4_BLOCK_SIZE;
 
@@ -186,7 +189,8 @@ int test_mixed_gemm(cublasHandle_t cublas) {
         __nv_fp8_e4m3* d_B_scales;
         CHECK_CUDA(cudaMalloc(&d_B_data, data_bytes));
         CHECK_CUDA(cudaMalloc(&d_B_scales, scale_count * sizeof(__nv_fp8_e4m3)));
-        CHECK_CUDA(cudaMemset(d_B_data, 0x55, data_bytes));  // Dummy pattern
+        CHECK_CUDA(cudaMemset(d_B_data, 0x55, data_bytes));
+        CHECK_CUDA(cudaMemset(d_B_scales, 0x3C, scale_count));
 
         blaze::Fp4WeightTensor B_weight;
         B_weight.data = d_B_data;
@@ -195,30 +199,21 @@ int test_mixed_gemm(cublasHandle_t cublas) {
         B_weight.rows = tc.K;
         B_weight.cols = tc.N;
 
-        // Output
         half* d_C;
         CHECK_CUDA(cudaMalloc(&d_C, tc.M * tc.N * sizeof(half)));
 
-        // Run
         blaze::launch_gemm_mixed(d_A, B_weight, d_C, tc.M, tc.N, tc.K);
         CHECK_CUDA(cudaDeviceSynchronize());
 
-        // Sanity check
         auto* h_C = new half[tc.M * tc.N];
         CHECK_CUDA(cudaMemcpy(h_C, d_C, tc.M * tc.N * sizeof(half),
                               cudaMemcpyDeviceToHost));
 
-        bool has_nan = false;
-        for (int i = 0; i < tc.M * tc.N; i++) {
-            float v = __half2float(h_C[i]);
-            if (isnan(v) || isinf(v)) { has_nan = true; break; }
-        }
-
-        if (has_nan) {
-            printf("FAIL (NaN/Inf)\n");
-        } else {
+        if (check_no_nan_inf(h_C, tc.M * tc.N)) {
             printf("PASS\n");
             passed++;
+        } else {
+            printf("FAIL (NaN/Inf)\n");
         }
 
         delete[] h_A;
@@ -233,6 +228,89 @@ int test_mixed_gemm(cublasHandle_t cublas) {
     return passed == total ? 0 : 1;
 }
 
+// ---------------------------------------------------------------------------
+// FP4 GEMM: NVFP4 × NVFP4 → FP16
+// ---------------------------------------------------------------------------
+
+int test_fp4_gemm(cublasHandle_t cublas) {
+    printf("\n=== FP4 GEMM Tests (E2M1 x E2M1) ===\n");
+    int passed = 0;
+    int total = sizeof(llama_shapes) / sizeof(llama_shapes[0]);
+
+    for (int t = 0; t < total; t++) {
+        auto& tc = llama_shapes[t];
+
+        // FP4 TILE_K=128: align K up to tile boundary.
+        int K_aligned = ((tc.K + 127) / 128) * 128;
+
+        printf("  [%d/%d] %s (M=%d, N=%d, K=%d)... ",
+               t + 1, total, tc.name, tc.M, tc.N, K_aligned);
+
+        int a_data_bytes  = tc.M * K_aligned / 2;
+        int a_scale_count = tc.M * K_aligned / blaze::FP4_BLOCK_SIZE;
+
+        uint8_t* d_A_data;
+        __nv_fp8_e4m3* d_A_scales;
+        CHECK_CUDA(cudaMalloc(&d_A_data, a_data_bytes));
+        CHECK_CUDA(cudaMalloc(&d_A_scales, a_scale_count * sizeof(__nv_fp8_e4m3)));
+        CHECK_CUDA(cudaMemset(d_A_data, 0x55, a_data_bytes));
+        CHECK_CUDA(cudaMemset(d_A_scales, 0x3C, a_scale_count));
+
+        blaze::Fp4WeightTensor A_weight;
+        A_weight.data = d_A_data;
+        A_weight.block_scales = d_A_scales;
+        A_weight.tensor_scale = 1.0f;
+        A_weight.rows = tc.M;
+        A_weight.cols = K_aligned;
+
+        int b_data_bytes  = K_aligned * tc.N / 2;
+        int b_scale_count = K_aligned * tc.N / blaze::FP4_BLOCK_SIZE;
+
+        uint8_t* d_B_data;
+        __nv_fp8_e4m3* d_B_scales;
+        CHECK_CUDA(cudaMalloc(&d_B_data, b_data_bytes));
+        CHECK_CUDA(cudaMalloc(&d_B_scales, b_scale_count * sizeof(__nv_fp8_e4m3)));
+        CHECK_CUDA(cudaMemset(d_B_data, 0x55, b_data_bytes));
+        CHECK_CUDA(cudaMemset(d_B_scales, 0x3C, b_scale_count));
+
+        blaze::Fp4WeightTensor B_weight;
+        B_weight.data = d_B_data;
+        B_weight.block_scales = d_B_scales;
+        B_weight.tensor_scale = 1.0f;
+        B_weight.rows = K_aligned;
+        B_weight.cols = tc.N;
+
+        half* d_C;
+        CHECK_CUDA(cudaMalloc(&d_C, tc.M * tc.N * sizeof(half)));
+
+        blaze::launch_gemm_fp4(A_weight, B_weight, d_C, tc.M, tc.N, K_aligned);
+        CHECK_CUDA(cudaDeviceSynchronize());
+
+        auto* h_C = new half[tc.M * tc.N];
+        CHECK_CUDA(cudaMemcpy(h_C, d_C, tc.M * tc.N * sizeof(half),
+                              cudaMemcpyDeviceToHost));
+
+        if (check_no_nan_inf(h_C, tc.M * tc.N)) {
+            printf("PASS\n");
+            passed++;
+        } else {
+            printf("FAIL (NaN/Inf)\n");
+        }
+
+        delete[] h_C;
+        CHECK_CUDA(cudaFree(d_A_data));
+        CHECK_CUDA(cudaFree(d_A_scales));
+        CHECK_CUDA(cudaFree(d_B_data));
+        CHECK_CUDA(cudaFree(d_B_scales));
+        CHECK_CUDA(cudaFree(d_C));
+    }
+
+    printf("  FP4 GEMM: %d/%d passed\n", passed, total);
+    return passed == total ? 0 : 1;
+}
+
+// ---------------------------------------------------------------------------
+
 int main() {
     printf("=== Blaze: Phase 1 GEMM Correctness Tests ===\n");
 
@@ -243,6 +321,7 @@ int main() {
     int ret = 0;
     ret |= test_fp8_gemm(cublas);
     ret |= test_mixed_gemm(cublas);
+    ret |= test_fp4_gemm(cublas);
 
     cublasDestroy(cublas);
 
