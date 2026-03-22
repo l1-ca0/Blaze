@@ -1,5 +1,5 @@
 /**
- * test_tcgen05.cu — SM100 tcgen05 primitive isolation tests.
+ * test_sm100_primitives.cu — SM100 tcgen05 primitive isolation tests.
  *
  * Tests TMEM, tcgen05.mma, and TMA in increasing complexity:
  *   Test 1:  TMEM alloc/dealloc (no MMA, no TMA)
@@ -120,8 +120,8 @@ test_mma_no_tma_kernel(float* C_out) {
     tmem_addr_t tmem_addr = smem->tmem_addr;
     __syncthreads();
 
-    // MMA K-loop: FP8 E4M3 K_per_mma=32, TILE_K=64 → 2 iterations
-    {
+    // MMA K-loop: only warp 0 issues MMA 
+    if (warp_id == 0) {
         constexpr int K_PER_MMA = 32;
         constexpr int NUM_K_ITERS = TILE_K / K_PER_MMA;
 
@@ -208,8 +208,8 @@ test_mma_with_tma_kernel(
     mbarrier_wait(&smem->mbar[0], 0);
     __syncthreads();
 
-    // MMA K-loop: FP8 E4M3 K_per_mma=32, TILE_K=64 → 2 iterations
-    {
+    // MMA K-loop: only warp 0 issues MMA
+    if (warp_id == 0) {
         constexpr int K_PER_MMA = 32;
         constexpr int NUM_K_ITERS = TILE_K / K_PER_MMA;
 
@@ -294,8 +294,8 @@ test_mma_tma_no_swizzle_kernel(
     mbarrier_wait(&smem->mbar[0], 0);
     __syncthreads();
 
-    // MMA K-loop with no-swizzle descriptors (layout_type=0)
-    {
+    // MMA K-loop: only warp 0, no-swizzle descriptors (layout_type=0)
+    if (warp_id == 0) {
         constexpr int K_PER_MMA = 32;
         constexpr int NUM_K_ITERS = TILE_K / K_PER_MMA;
 
