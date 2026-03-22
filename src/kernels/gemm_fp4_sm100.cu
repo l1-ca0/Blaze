@@ -1,13 +1,19 @@
 /**
- * gemm_fp4_sm100.cu — Production NVFP4 GEMM kernel for SM100 (Blackwell).
+ * gemm_fp4_sm100.cu — NVFP4 GEMM for SM100 (Blackwell).
  *
- * Extends the FP8 kernel architecture to handle NVFP4 (E2M1) format:
- *   - TMA loads FP4 packed data (2 values/byte) + block scales (E4M3)
- *   - tcgen05.mma with .e2m1 input format
- *   - Hardware applies block scales during MMA (Transformer Engine path)
- *   - Tensor-level scale applied in epilogue
+ * Computes C[M,N] = A[M,K] × B[K,N] where both A and B are in NVFP4
+ * format (E2M1 data + E4M3 block scales + FP32 tensor scale).
+ * FP32 TMEM accumulator, FP16 output. Tensor scales applied in epilogue.
  *
- * Tile: 128×128×128 (M×N×K) — same memory footprint as FP8 128×128×64.
+ * Warp-specialized, 2-stage double-buffered pipeline:
+ *   Warp 0: MMA consumer  (tcgen05.mma.kind::f8f6f4, E2M1 × E2M1)
+ *   Warp 1: TMA producer  (async bulk loads for packed data; global loads for scales)
+ *   Warp 2: Idle
+ *   Warp 3: Epilogue      (TMEM → SMEM → global store with tensor scale)
+ *
+ * Tile: 128×128×128 (M×N×K). K_PER_MMA=64, 2 inner iterations per tile.
+ * Packed data loaded via TMA; block scales loaded via warp-cooperative
+ * global memory reads (scale tiles are too narrow for TMA's 16-byte minimum).
  */
 
 #include "gemm/fp4_gemm_sm100.cuh"
@@ -23,170 +29,135 @@ namespace blaze {
 
 using Config = Fp4GemmConfig;
 
-/**
- * Shared memory layout for FP4 GEMM.
- *
- * Each stage holds: packed FP4 data + block scales for both A and B.
- * The C staging area is shared across stages (only used in epilogue).
- */
-struct Fp4SmemLayout {
-    // Double-buffered input tiles
+struct __align__(128) Fp4SmemLayout {
+    alignas(8) uint64_t mbar_load[Config::PIPELINE_STAGES];
+    alignas(8) uint64_t mbar_mma[Config::PIPELINE_STAGES];
+    uint32_t tmem_addr;
+    char _pad[128 - (2 * 16 + 4)];
+
     uint8_t A_data[Config::PIPELINE_STAGES][Config::TILE_M * Config::TILE_K / 2];
     uint8_t B_data[Config::PIPELINE_STAGES][Config::TILE_K * Config::TILE_N / 2];
-
-    // Block scales for each stage
-    __nv_fp8_e4m3 A_scales[Config::PIPELINE_STAGES][Config::TILE_M * Config::TILE_K / FP4_BLOCK_SIZE];
-    __nv_fp8_e4m3 B_scales[Config::PIPELINE_STAGES][Config::TILE_K * Config::TILE_N / FP4_BLOCK_SIZE];
-
-    // Output staging
+    __nv_fp8_e4m3 A_scales[Config::PIPELINE_STAGES][Config::SMEM_A_SCALE_BYTES];
+    __nv_fp8_e4m3 B_scales[Config::PIPELINE_STAGES][Config::SMEM_B_SCALE_BYTES];
     float C[Config::TILE_M * Config::TILE_N];
-
-    // Synchronization barriers
-    uint64_t mbar_load[Config::PIPELINE_STAGES];
-    uint64_t mbar_mma[Config::PIPELINE_STAGES];
 };
 
-/**
- * TMA Producer for FP4: loads packed data and block scales.
- */
 __device__ __forceinline__
 void fp4_tma_producer(
     Fp4SmemLayout* smem,
     const TmaDescriptor* desc_A_data,
     const TmaDescriptor* desc_B_data,
-    const TmaDescriptor* desc_A_scales,
-    const TmaDescriptor* desc_B_scales,
-    int bm, int bn, int K,
-    int lane_id
+    const __nv_fp8_e4m3* global_A_scales,
+    const __nv_fp8_e4m3* global_B_scales,
+    int bm, int bn, int M, int N, int K, int lane_id
 ) {
     const int num_k_tiles = K / Config::TILE_K;
+    const int a_scale_stride = K / FP4_BLOCK_SIZE;
+    const int b_scale_stride = N / FP4_BLOCK_SIZE;
 
     for (int k_tile = 0; k_tile < num_k_tiles; k_tile++) {
         int stage = k_tile % Config::PIPELINE_STAGES;
         int k_offset = k_tile * Config::TILE_K;
 
-        if (lane_id == 0) {
-            // Expected bytes: packed data + scales for both A and B
-            uint32_t tx_bytes =
-                Config::SMEM_A_DATA_BYTES + Config::SMEM_B_DATA_BYTES +
-                Config::SMEM_A_SCALE_BYTES + Config::SMEM_B_SCALE_BYTES;
+        if (k_tile >= Config::PIPELINE_STAGES) {
+            mbarrier_wait(&smem->mbar_mma[stage],
+                         ((k_tile / Config::PIPELINE_STAGES) + 1) & 1);
+        }
 
+        if (lane_id == 0) {
+            uint32_t tx_bytes = Config::SMEM_A_DATA_BYTES + Config::SMEM_B_DATA_BYTES;
             mbarrier_expect_tx(&smem->mbar_load[stage], tx_bytes);
 
-            // Load FP4 packed data
-            // A_data: (M, K/2) in bytes → tile at (bm, k_offset/2)
             tma_load_2d(smem->A_data[stage], desc_A_data,
                         k_offset / 2, bm, &smem->mbar_load[stage]);
             tma_load_2d(smem->B_data[stage], desc_B_data,
                         bn / 2, k_offset, &smem->mbar_load[stage]);
-
-            // Load block scales
-            // A_scales: (M, K/BLOCK_SIZE) → tile at (bm, k_offset/BLOCK_SIZE)
-            tma_load_2d(smem->A_scales[stage], desc_A_scales,
-                        k_offset / FP4_BLOCK_SIZE, bm, &smem->mbar_load[stage]);
-            tma_load_2d(smem->B_scales[stage], desc_B_scales,
-                        bn / FP4_BLOCK_SIZE, k_offset, &smem->mbar_load[stage]);
         }
 
-        // Wait for MMA to release this buffer (if not first iterations)
-        if (k_tile >= Config::PIPELINE_STAGES) {
-            mbarrier_wait(&smem->mbar_mma[stage],
-                         (k_tile / Config::PIPELINE_STAGES) & 1);
+        // Warp-cooperative load of A block scales from global memory.
+        {
+            const int a_scale_col_start = k_offset / FP4_BLOCK_SIZE;
+            const int total_a = Config::SMEM_A_SCALE_BYTES;
+            for (int i = lane_id; i < total_a; i += 32) {
+                int row = i / Config::A_SCALE_COLS;
+                int col = i % Config::A_SCALE_COLS;
+                int global_idx = (bm + row) * a_scale_stride + (a_scale_col_start + col);
+                smem->A_scales[stage][i] = global_A_scales[global_idx];
+            }
+        }
+
+        // Warp-cooperative load of B block scales from global memory.
+        {
+            const int b_scale_col_start = bn / FP4_BLOCK_SIZE;
+            const int total_b = Config::SMEM_B_SCALE_BYTES;
+            for (int i = lane_id; i < total_b; i += 32) {
+                int row = i / Config::B_SCALE_COLS;
+                int col = i % Config::B_SCALE_COLS;
+                int global_idx = (k_offset + row) * b_scale_stride + (b_scale_col_start + col);
+                smem->B_scales[stage][i] = global_B_scales[global_idx];
+            }
         }
     }
 }
 
-/**
- * MMA Consumer for FP4: issues tcgen05.mma with .e2m1 format.
- *
- * The hardware handles FP4 dequantization and block scale application
- * when using the Transformer Engine path. The block scales must be
- * in a specific layout adjacent to the data in shared memory.
- */
+/** MMA consumer: issues tcgen05.mma across K tiles with double-buffered SMEM. */
 __device__ __forceinline__
-void fp4_mma_consumer(
-    Fp4SmemLayout* smem,
-    tmem_addr_t tmem_addr,
-    int K,
-    int warp_id
-) {
+void fp4_mma_consumer(Fp4SmemLayout* smem, tmem_addr_t tmem_addr, int K) {
     const int num_k_tiles = K / Config::TILE_K;
+    constexpr int K_PER_MMA = 64;
+    constexpr int NUM_K_ITERS = Config::TILE_K / K_PER_MMA;
+
+    uint32_t idesc = make_idesc_f8f6f4(5, 5, Config::TILE_M, Config::TILE_N);
+    bool first_mma = true;
 
     for (int k_tile = 0; k_tile < num_k_tiles; k_tile++) {
         int stage = k_tile % Config::PIPELINE_STAGES;
+        mbarrier_wait(&smem->mbar_load[stage], (k_tile / Config::PIPELINE_STAGES) & 1);
 
-        // Wait for TMA to complete
-        mbarrier_wait(&smem->mbar_load[stage],
-                     (k_tile / Config::PIPELINE_STAGES) & 1);
+        uint32_t smem_a_base = static_cast<uint32_t>(__cvta_generic_to_shared(smem->A_data[stage]));
+        uint32_t smem_b_base = static_cast<uint32_t>(__cvta_generic_to_shared(smem->B_data[stage]));
 
-        // Issue tcgen05.mma with FP4 (E2M1) input format
-        // The .kind::f8f6f4 selector with E2M1 data tells the hardware
-        // to interpret the SMEM data as FP4 with block scaling.
-        uint32_t smem_a_addr = static_cast<uint32_t>(
-            __cvta_generic_to_shared(smem->A_data[stage]));
-        uint32_t smem_b_addr = static_cast<uint32_t>(
-            __cvta_generic_to_shared(smem->B_data[stage]));
+        for (int ki = 0; ki < NUM_K_ITERS; ki++) {
+            asm volatile("tcgen05.fence::after_thread_sync;\n" ::: "memory");
 
-        // FP4 MMA with block scale descriptors
-        // The scale tensors must be laid out contiguously after the data
-        // in the format expected by tcgen05.
-        uint32_t smem_a_scale_addr = static_cast<uint32_t>(
-            __cvta_generic_to_shared(smem->A_scales[stage]));
-        uint32_t smem_b_scale_addr = static_cast<uint32_t>(
-            __cvta_generic_to_shared(smem->B_scales[stage]));
+            uint32_t smem_a_addr = smem_a_base + ki * (K_PER_MMA / 2);
+            uint32_t smem_b_addr = smem_b_base + ki * (K_PER_MMA / 2) * Config::TILE_N;
 
-        // tcgen05.mma for FP4:
-        // Input A: E2M1 from SMEM + block scales
-        // Input B: E2M1 from SMEM + block scales
-        // Accumulator: FP32 in TMEM
-        asm volatile(
-            "{\n"
-            "  tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], %1, %2, %3, 0;\n"
-            "}\n"
-            :
-            : "r"(tmem_addr),
-              "l"((uint64_t)smem_a_addr),
-              "l"((uint64_t)smem_b_addr),
-              "r"(1)  // accumulate
-            : "memory"
-        );
+            uint64_t desc_a = make_smem_desc(smem_a_addr, Config::TILE_K / 2, 4);
+            uint64_t desc_b = make_smem_desc(smem_b_addr, Config::TILE_N / 2, 4);
+
+            if (elect_one_sync()) {
+                if (first_mma) {
+                    asm volatile(
+                        "tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], %1, %2, %3, 0;\n"
+                        : : "r"(tmem_addr), "l"(desc_a), "l"(desc_b), "r"(idesc) : "memory");
+                } else {
+                    asm volatile(
+                        "tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], %1, %2, %3, 1;\n"
+                        : : "r"(tmem_addr), "l"(desc_a), "l"(desc_b), "r"(idesc) : "memory");
+                }
+            }
+            first_mma = false;
+
+            asm volatile("tcgen05.fence::before_thread_sync;\n" ::: "memory");
+        }
 
         __syncwarp();
-
-        // Signal MMA completion
-        if (warp_id == 1) {
+        if (elect_one_sync()) {
             mbarrier_arrive(&smem->mbar_mma[stage]);
         }
     }
 }
 
-/**
- * FP4 Epilogue: applies tensor-level scale and stores output.
- *
- * The accumulator in TMEM contains:
- *   sum_k( dequant(A_fp4) * dequant(B_fp4) )
- * which has been scaled by block scales but NOT by tensor scales.
- * The epilogue multiplies by tensor_scale_A * tensor_scale_B.
- */
 __device__ __forceinline__
 void fp4_epilogue(
-    Fp4SmemLayout* smem,
-    tmem_addr_t tmem_addr,
-    half* C_global,
-    int bm, int bn, int M, int N,
+    Fp4SmemLayout* smem, tmem_addr_t tmem_addr,
+    half* C_global, int bm, int bn, int M, int N,
     float scale_A, float scale_B,
-    const half* bias,
-    Fp4Epilogue epilogue_op,
-    int tid
+    const half* bias, Fp4Epilogue epilogue_op, int tid
 ) {
-    int local_tid = tid % 32;  // Thread within warp
+    int local_tid = tid % 32;
     float combined_scale = scale_A * scale_B;
-
-    // TMEM → SMEM via tcgen05.ld (all warp threads participate)
-    tmem_store_to_smem(smem->C, tmem_addr, Config::TILE_N);
-    __syncwarp();
-
-    // Apply tensor scale, epilogue ops, and store to global
     const int elems_per_thread = (Config::TILE_M * Config::TILE_N) / 32;
 
     for (int i = 0; i < elems_per_thread; i++) {
@@ -219,16 +190,13 @@ void fp4_epilogue(
     }
 }
 
-/**
- * Main FP4 GEMM kernel.
- */
 __cluster_dims__(1, 1, 1)
 __global__ void __launch_bounds__(Config::BLOCK_SIZE)
 gemm_fp4_kernel(
     const TmaDescriptor* __restrict__ desc_A_data,
     const TmaDescriptor* __restrict__ desc_B_data,
-    const TmaDescriptor* __restrict__ desc_A_scales,
-    const TmaDescriptor* __restrict__ desc_B_scales,
+    const __nv_fp8_e4m3* __restrict__ global_A_scales,
+    const __nv_fp8_e4m3* __restrict__ global_B_scales,
     half* __restrict__ C,
     int M, int N, int K,
     float scale_A, float scale_B,
@@ -241,11 +209,9 @@ gemm_fp4_kernel(
     const int tid = threadIdx.x;
     const int warp_id = tid / 32;
     const int lane_id = tid % 32;
-
     const int bm = blockIdx.y * Config::TILE_M;
     const int bn = blockIdx.x * Config::TILE_N;
 
-    // Initialize barriers
     if (tid == 0) {
         for (int s = 0; s < Config::PIPELINE_STAGES; s++) {
             mbarrier_init(&smem->mbar_load[s], 1);
@@ -254,34 +220,36 @@ gemm_fp4_kernel(
     }
     __syncthreads();
 
-    // Allocate TMEM
-    __shared__ uint32_t smem_tmem_addr;
     tmem_addr_t tmem_addr;
     if (warp_id == 0) {
-        tmem_alloc(&smem_tmem_addr, Config::TMEM_COLUMNS);
+        tmem_alloc(&smem->tmem_addr, Config::TMEM_COLUMNS);
     }
     __syncthreads();
-    tmem_addr = smem_tmem_addr;
+    tmem_addr = smem->tmem_addr;
 
-    // Warp-specialized execution
     switch (warp_id) {
-        case 0:  // TMA Producer
-            fp4_tma_producer(smem, desc_A_data, desc_B_data,
-                            desc_A_scales, desc_B_scales,
-                            bm, bn, K, lane_id);
+        case 0:
+            fp4_mma_consumer(smem, tmem_addr, K);
             break;
         case 1:
-        case 2:  // MMA Consumers
-            fp4_mma_consumer(smem, tmem_addr, K, warp_id);
+            fp4_tma_producer(smem, desc_A_data, desc_B_data,
+                            global_A_scales, global_B_scales,
+                            bm, bn, M, N, K, lane_id);
             break;
-        case 3:  // Epilogue
-            __syncthreads();
-            fp4_epilogue(smem, tmem_addr, C, bm, bn, M, N,
-                        scale_A, scale_B, bias, epilogue_op, tid);
+        case 2:
+        case 3:
             break;
     }
 
-    // Deallocate TMEM
+    __syncthreads();
+    tmem_store_to_smem_warp(smem->C, tmem_addr, Config::TILE_N, warp_id);
+    __syncthreads();
+
+    if (warp_id == 3) {
+        fp4_epilogue(smem, tmem_addr, C, bm, bn, M, N,
+                    scale_A, scale_B, bias, epilogue_op, tid);
+    }
+
     __syncthreads();
     if (warp_id == 0) {
         tmem_dealloc(tmem_addr, Config::TMEM_COLUMNS);
@@ -299,54 +267,55 @@ void launch_gemm_fp4(
     Fp4Epilogue epilogue,
     cudaStream_t stream
 ) {
-    // Create TMA descriptors for data and scales
-    TmaDescriptor h_desc_A_data, h_desc_B_data, h_desc_A_scales, h_desc_B_scales;
+    const uint8_t* A_data_tma = A.data;
+    const __nv_fp8_e4m3* A_scales_ptr = A.block_scales;
+    uint8_t* A_data_padded = nullptr;
+    __nv_fp8_e4m3* A_scales_padded = nullptr;
+    int M_tma = M;
 
-    // A data: (M, K/2) uint8 (FP4 packed)
-    create_tma_desc_2d(&h_desc_A_data, A.data, CU_TENSOR_MAP_DATA_TYPE_UINT8,
-                       M, K / 2,
-                       Config::TILE_M, Config::TILE_K / 2,
-                       TmaSwizzle::B128);
+    if (M < Config::TILE_M) {
+        M_tma = Config::TILE_M;
+        size_t data_bytes = (size_t)M_tma * K / 2;
+        size_t scale_count = (size_t)M_tma * K / FP4_BLOCK_SIZE;
+        cudaMalloc(&A_data_padded, data_bytes);
+        cudaMalloc(&A_scales_padded, scale_count * sizeof(__nv_fp8_e4m3));
+        cudaMemsetAsync(A_data_padded, 0, data_bytes, stream);
+        cudaMemsetAsync(A_scales_padded, 0, scale_count * sizeof(__nv_fp8_e4m3), stream);
+        cudaMemcpyAsync(A_data_padded, A.data, (size_t)M * K / 2,
+                        cudaMemcpyDeviceToDevice, stream);
+        cudaMemcpyAsync(A_scales_padded, A.block_scales,
+                        (size_t)M * K / FP4_BLOCK_SIZE * sizeof(__nv_fp8_e4m3),
+                        cudaMemcpyDeviceToDevice, stream);
+        A_data_tma = A_data_padded;
+        A_scales_ptr = A_scales_padded;
+    }
 
-    // B data: (K, N/2) uint8
+    // TMA descriptors for packed data only; scales loaded via global memory.
+    TmaDescriptor h_desc_A_data, h_desc_B_data;
+
+    create_tma_desc_2d(&h_desc_A_data, A_data_tma, CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                       M_tma, K / 2, Config::TILE_M, Config::TILE_K / 2, TmaSwizzle::B64);
     create_tma_desc_2d(&h_desc_B_data, B.data, CU_TENSOR_MAP_DATA_TYPE_UINT8,
-                       K, N / 2,
-                       Config::TILE_K, Config::TILE_N / 2,
-                       TmaSwizzle::B128);
+                       K, N / 2, Config::TILE_K, Config::TILE_N / 2, TmaSwizzle::B64);
 
-    // A scales: (M, K/BLOCK_SIZE) FP8
-    create_tma_desc_2d(&h_desc_A_scales, A.block_scales, CU_TENSOR_MAP_DATA_TYPE_UINT8,
-                       M, K / FP4_BLOCK_SIZE,
-                       Config::TILE_M, Config::TILE_K / FP4_BLOCK_SIZE,
-                       TmaSwizzle::NONE);
-
-    // B scales: (K, N/BLOCK_SIZE) FP8
-    create_tma_desc_2d(&h_desc_B_scales, B.block_scales, CU_TENSOR_MAP_DATA_TYPE_UINT8,
-                       K, N / FP4_BLOCK_SIZE,
-                       Config::TILE_K, Config::TILE_N / FP4_BLOCK_SIZE,
-                       TmaSwizzle::NONE);
-
-    // Copy descriptors to device
     TmaDescriptor *d_descs;
-    cudaMalloc(&d_descs, 4 * sizeof(TmaDescriptor));
-    cudaMemcpyAsync(d_descs, &h_desc_A_data, sizeof(TmaDescriptor),
-                    cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_descs + 1, &h_desc_B_data, sizeof(TmaDescriptor),
-                    cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_descs + 2, &h_desc_A_scales, sizeof(TmaDescriptor),
-                    cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_descs + 3, &h_desc_B_scales, sizeof(TmaDescriptor),
-                    cudaMemcpyHostToDevice, stream);
+    cudaMalloc(&d_descs, 2 * sizeof(TmaDescriptor));
+    cudaMemcpyAsync(d_descs,     &h_desc_A_data, sizeof(TmaDescriptor), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_descs + 1, &h_desc_B_data, sizeof(TmaDescriptor), cudaMemcpyHostToDevice, stream);
 
     dim3 grid((N + Config::TILE_N - 1) / Config::TILE_N,
               (M + Config::TILE_M - 1) / Config::TILE_M);
     dim3 block(Config::BLOCK_SIZE);
     size_t smem_size = sizeof(Fp4SmemLayout);
 
-    cudaFuncSetAttribute(gemm_fp4_kernel,
+    cudaError_t err = cudaFuncSetAttribute(gemm_fp4_kernel,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "FP4 GEMM: cudaFuncSetAttribute failed: %s (smem=%zu)\n",
+                cudaGetErrorString(err), smem_size);
+        return;
+    }
 
-    // Cluster launch required for tcgen05 instructions
     cudaLaunchConfig_t launch_config = {};
     launch_config.gridDim = grid;
     launch_config.blockDim = block;
@@ -362,12 +331,12 @@ void launch_gemm_fp4(
     launch_config.numAttrs = 1;
 
     cudaLaunchKernelEx(&launch_config, gemm_fp4_kernel,
-        d_descs, d_descs + 1, d_descs + 2, d_descs + 3,
-        C, M, N, K,
-        A.tensor_scale, B.tensor_scale,
-        bias, epilogue);
+        d_descs, d_descs + 1, A_scales_ptr, B.block_scales,
+        C, M, N, K, A.tensor_scale, B.tensor_scale, bias, epilogue);
 
     cudaFreeAsync(d_descs, stream);
+    if (A_data_padded) cudaFreeAsync(A_data_padded, stream);
+    if (A_scales_padded) cudaFreeAsync(A_scales_padded, stream);
 }
 
 }  // namespace blaze

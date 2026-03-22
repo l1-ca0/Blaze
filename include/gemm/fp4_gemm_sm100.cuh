@@ -3,12 +3,17 @@
  * fp4_gemm_sm100.cuh — NVFP4 GEMM kernel interface for SM100 (Blackwell).
  *
  * NVFP4 (E2M1) format with two-level scaling:
- *   - Tensor-level scale: FP32, one per tensor
- *   - Block-level scale: E4M3 (FP8), one per 16 elements along K
- *   - Data: E2M1, packed 2 values per byte
+ *   - Tensor-level scale: FP32 scalar, one per tensor
+ *   - Block-level scale:  E4M3 (FP8), one per 16 consecutive elements
+ *   - Data:               E2M1, packed 2 values per byte
  *
- * Tile: 128×128×128 (M×N×K) — 2× K of FP8 due to packing.
- * Same warp-specialized architecture as FP8.
+ * Warp-specialized, 2-stage double-buffered pipeline:
+ *   Warp 0: MMA consumer  (tcgen05.mma.kind::f8f6f4, E2M1 × E2M1)
+ *   Warp 1: TMA producer  (packed data via TMA, scales via global loads)
+ *   Warp 2: Idle
+ *   Warp 3: Epilogue      (TMEM → SMEM → global store with tensor scale)
+ *
+ * Tile: 128×128×128 (M×N×K). K_PER_MMA=64, 2 inner iterations per tile.
  */
 
 #include <cuda_runtime.h>
@@ -26,19 +31,21 @@ constexpr int FP4_BLOCK_SIZE = 16;  // Block scale group size
 struct Fp4GemmConfig {
     static constexpr int TILE_M = 128;
     static constexpr int TILE_N = 128;
-    static constexpr int TILE_K = 128;  // 2× FP8 due to FP4 packing (same bytes)
-    static constexpr int BLOCK_SIZE = 128;  // 4 warps
+    static constexpr int TILE_K = 128;             // 2× FP8 tile (same byte count due to packing)
+    static constexpr int BLOCK_SIZE = 128;         // 4 warps
     static constexpr int PIPELINE_STAGES = 2;
 
-    // FP4 packed: 2 values per byte → TILE_M * TILE_K / 2 bytes for data
-    static constexpr int SMEM_A_DATA_BYTES = TILE_M * TILE_K / 2;           // 8 KB
-    static constexpr int SMEM_B_DATA_BYTES = TILE_K * TILE_N / 2;           // 8 KB
+    // Per-stage SMEM for packed data (2 values per byte)
+    static constexpr int SMEM_A_DATA_BYTES = TILE_M * TILE_K / 2;   // 8 KB
+    static constexpr int SMEM_B_DATA_BYTES = TILE_K * TILE_N / 2;   // 8 KB
 
-    // Block scales: 1 FP8 per 16 values along K
-    static constexpr int SMEM_A_SCALE_BYTES = (TILE_M * TILE_K / FP4_BLOCK_SIZE) * sizeof(__nv_fp8_e4m3);
-    static constexpr int SMEM_B_SCALE_BYTES = (TILE_K * TILE_N / FP4_BLOCK_SIZE) * sizeof(__nv_fp8_e4m3);
+    // Per-stage SMEM for block scales (1 E4M3 per 16 values along K)
+    static constexpr int A_SCALE_COLS = TILE_K / FP4_BLOCK_SIZE;    // 8
+    static constexpr int B_SCALE_COLS = TILE_N / FP4_BLOCK_SIZE;    // 8
+    static constexpr int SMEM_A_SCALE_BYTES = TILE_M * A_SCALE_COLS;  // 1024
+    static constexpr int SMEM_B_SCALE_BYTES = TILE_K * B_SCALE_COLS;  // 1024
 
-    static constexpr int SMEM_C_BYTES = TILE_M * TILE_N * sizeof(float);    // 64 KB
+    static constexpr int SMEM_C_BYTES = TILE_M * TILE_N * sizeof(float);  // 64 KB
 
     static constexpr int TOTAL_SMEM_BYTES =
         PIPELINE_STAGES * (SMEM_A_DATA_BYTES + SMEM_B_DATA_BYTES +
