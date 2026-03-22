@@ -37,28 +37,6 @@ add_library(blaze_gemm STATIC
 )
 target_link_libraries(blaze_gemm CUDA::cuda_driver)
 
-# --- Phase 2: Attention kernels ---
-add_library(blaze_attention STATIC
-    src/kernels/flash_prefill_sm100.cu
-    src/kernels/flash_decode_sm100.cu
-)
-
-# --- Phase 4: Supporting ops ---
-add_library(blaze_ops STATIC
-    src/kernels/rmsnorm.cu
-    src/kernels/rope.cu
-    src/kernels/silu.cu
-)
-
-# --- Runtime library ---
-add_library(blaze_runtime STATIC
-    src/runtime/model_runner.cu
-    src/runtime/kv_cache.cpp
-    src/runtime/generate.cpp
-    src/runtime/weight_loader.cpp
-)
-target_link_libraries(blaze_runtime blaze_gemm blaze_attention blaze_ops)
-
 # --- Tests ---
 add_executable(test_gemm_naive tests/test_gemm_naive.cu)
 target_link_libraries(test_gemm_naive CUDA::cublas)
@@ -66,20 +44,9 @@ target_link_libraries(test_gemm_naive CUDA::cublas)
 add_executable(test_gemm tests/test_gemm.cu)
 target_link_libraries(test_gemm blaze_gemm CUDA::cublas)
 
-add_executable(test_attention tests/test_attention.cu)
-target_link_libraries(test_attention blaze_attention CUDA::cublas)
+add_executable(test_sm100_primitives tests/test_sm100_primitives.cu)
+target_link_libraries(test_sm100_primitives CUDA::cuda_driver)
 
 # --- Benchmarks ---
 add_executable(bench_gemm benchmarks/bench_gemm.cu)
 target_link_libraries(bench_gemm blaze_gemm CUDA::cublas)
-
-add_executable(bench_attention benchmarks/bench_attention.cu)
-target_link_libraries(bench_attention blaze_attention)
-
-# --- Python bindings (pybind11) ---
-find_package(Python3 COMPONENTS Interpreter Development)
-find_package(pybind11 QUIET)
-if(pybind11_FOUND)
-    pybind11_add_module(blaze_ext src/runtime/python_bindings.cpp)
-    target_link_libraries(blaze_ext PRIVATE blaze_runtime)
-endif()
