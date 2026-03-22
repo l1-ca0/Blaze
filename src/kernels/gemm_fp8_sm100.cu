@@ -1,13 +1,16 @@
 /**
  * gemm_fp8_sm100.cu — FP8 GEMM for SM100 (Blackwell).
  *
- * Warp-specialized, 2-stage double-buffered TMA pipeline.
- *   Warp 0: MMA consumer (tcgen05.mma, must be warp 0)
- *   Warp 1: TMA producer (async loads A, B tiles)
- *   Warp 2: Idle
- *   Warp 3: Epilogue (SMEM -> global with optional fusion)
+ * Computes C[M,N] = A[M,K] × B[K,N] with E4M3 inputs, FP32 TMEM
+ * accumulator, and FP16 output. Optional bias/activation epilogue.
  *
- * Tile: 128x128x64, E4M3 inputs, FP32 accumulator in TMEM, FP16 output.
+ * Warp-specialized, 2-stage double-buffered TMA pipeline:
+ *   Warp 0: MMA consumer  (tcgen05.mma.kind::f8f6f4, E4M3 × E4M3)
+ *   Warp 1: TMA producer  (async bulk tensor loads for A, B)
+ *   Warp 2: Idle
+ *   Warp 3: Epilogue      (TMEM → SMEM → global store)
+ *
+ * Tile: 128×128×64 (M×N×K). K_PER_MMA=32, 2 inner iterations per tile.
  */
 
 #include "gemm/fp8_gemm_sm100.cuh"
@@ -68,10 +71,7 @@ void tma_producer(
     }
 }
 
-/**
- * MMA consumer: K_PER_MMA=32 for E4M3, 2 inner iterations per TILE_K=64.
- * First MMA uses scaleD=0 (overwrite), all subsequent use scaleD=1 (accumulate).
- */
+/** MMA consumer: issues tcgen05.mma across K tiles with double-buffered SMEM. */
 __device__ __forceinline__
 void mma_consumer(SmemLayout* smem, tmem_addr_t tmem_addr, int K) {
     const int num_k_tiles = K / Config::TILE_K;

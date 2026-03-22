@@ -2,13 +2,14 @@
 /**
  * fp8_gemm_sm100.cuh — FP8 GEMM kernel interface for SM100 (Blackwell).
  *
- * Warp-specialized, double-buffered TMA pipeline:
- *   Warp 0:    TMA producer (async loads A, B tiles)
- *   Warps 1-2: MMA consumer (tcgen05.mma with TMEM accumulation)
- *   Warp 3:    Epilogue (TMEM → SMEM → global, optional bias/activation fusion)
+ * Warp-specialized, 2-stage double-buffered TMA pipeline:
+ *   Warp 0: MMA consumer  (tcgen05.mma, E4M3 × E4M3, FP32 accumulator in TMEM)
+ *   Warp 1: TMA producer  (async bulk loads of A and B tiles via TMA)
+ *   Warp 2: Idle
+ *   Warp 3: Epilogue      (TMEM → SMEM → global, optional bias/activation fusion)
  *
- * Tile: 128×128×64 (M×N×K), 2-stage double-buffered pipeline.
- * Inputs: E4M3 (FP8), Accumulator: FP32 in TMEM, Output: FP16/BF16.
+ * Tile: 128×128×64 (M×N×K), K_PER_MMA=32 (2 inner iterations per tile).
+ * Inputs: E4M3 (FP8), Accumulator: FP32 in TMEM, Output: FP16.
  */
 
 #include <cuda_runtime.h>
@@ -18,23 +19,21 @@
 
 namespace blaze {
 
-// Tile dimensions for FP8 GEMM
 struct Fp8GemmConfig {
     static constexpr int TILE_M = 128;
     static constexpr int TILE_N = 128;
-    static constexpr int TILE_K = 64;   // FP8: 64 K per MMA
-    static constexpr int BLOCK_SIZE = 128;  // 4 warps
-    static constexpr int PIPELINE_STAGES = 2;  // Double buffer
+    static constexpr int TILE_K = 64;
+    static constexpr int BLOCK_SIZE = 128;         // 4 warps
+    static constexpr int PIPELINE_STAGES = 2;
 
-    static constexpr int SMEM_A_BYTES = TILE_M * TILE_K * sizeof(__nv_fp8_e4m3);  // 8 KB
-    static constexpr int SMEM_B_BYTES = TILE_K * TILE_N * sizeof(__nv_fp8_e4m3);  // 8 KB
-    static constexpr int SMEM_C_BYTES = TILE_M * TILE_N * sizeof(float);          // 64 KB
+    // Per-stage SMEM: A (8 KB) + B (8 KB), double-buffered. C staging (64 KB).
+    static constexpr int SMEM_A_BYTES = TILE_M * TILE_K * sizeof(__nv_fp8_e4m3);
+    static constexpr int SMEM_B_BYTES = TILE_K * TILE_N * sizeof(__nv_fp8_e4m3);
+    static constexpr int SMEM_C_BYTES = TILE_M * TILE_N * sizeof(float);
 
-    // Double-buffered: 2 × (A + B) + C staging
     static constexpr int TOTAL_SMEM_BYTES =
         PIPELINE_STAGES * (SMEM_A_BYTES + SMEM_B_BYTES) + SMEM_C_BYTES;
 
-    // TMEM columns needed: TILE_N columns for the accumulator
     static constexpr int TMEM_COLUMNS = TILE_N;
 };
 
