@@ -79,7 +79,8 @@ inline void create_tma_desc_2d(
         default: elem_size = 2; break;
     }
 
-    // Global dimensions (in elements)
+    // Global dimensions (in elements).
+    // Callers must ensure the allocation is at least box-sized in each dimension.
     uint64_t global_dim[2] = {cols, rows};
 
     // Global strides (in bytes). For row-major: stride[0] is the row stride.
@@ -102,6 +103,18 @@ inline void create_tma_desc_2d(
         default: cu_swizzle = CU_TENSOR_MAP_SWIZZLE_NONE; break;
     }
 
+    // OOB fill with NaN/zero is only valid for float types.
+    // For integer types (UINT8 used by FP8/FP4), must use FILL_NONE.
+    // Padded globalDim ensures the box always fits, so OOB won't occur.
+    bool is_float = (format == CU_TENSOR_MAP_DATA_TYPE_FLOAT16 ||
+                     format == CU_TENSOR_MAP_DATA_TYPE_BFLOAT16 ||
+                     format == CU_TENSOR_MAP_DATA_TYPE_FLOAT32 ||
+                     format == CU_TENSOR_MAP_DATA_TYPE_FLOAT64 ||
+                     format == CU_TENSOR_MAP_DATA_TYPE_TFLOAT32);
+    CUtensorMapFloatOOBfill oob_fill = is_float
+        ? CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA
+        : CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE;
+
     CUresult result = cuTensorMapEncodeTiled(
         reinterpret_cast<CUtensorMap*>(desc),
         format,
@@ -114,13 +127,14 @@ inline void create_tma_desc_2d(
         CU_TENSOR_MAP_INTERLEAVE_NONE,
         cu_swizzle,
         CU_TENSOR_MAP_L2_PROMOTION_NONE,
-        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+        oob_fill
     );
 
     if (result != CUDA_SUCCESS) {
         const char* err_str;
         cuGetErrorString(result, &err_str);
         fprintf(stderr, "TMA descriptor creation failed: %s\n", err_str);
+        exit(EXIT_FAILURE);
     }
 }
 
@@ -206,9 +220,9 @@ void mbarrier_wait(uint64_t* mbar_ptr, uint32_t phase) {
     asm volatile(
         "{\n"
         "  .reg .pred p;\n"
-        "  WAIT_LOOP:\n"
+        "  WAIT_LOOP_%=:\n"
         "  mbarrier.try_wait.parity.shared.b64 p, [%0], %1;\n"
-        "  @!p bra WAIT_LOOP;\n"
+        "  @!p bra WAIT_LOOP_%=;\n"
         "}\n"
         :
         : "r"(smem_addr), "r"(phase)
