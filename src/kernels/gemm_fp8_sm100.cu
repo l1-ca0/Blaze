@@ -291,4 +291,100 @@ void launch_gemm_fp8(
     if (A_padded) cudaFreeAsync(A_padded, stream);
 }
 
+// ---------------------------------------------------------------------------
+// Prepare/execute API
+// ---------------------------------------------------------------------------
+
+struct Fp8GemmPlan {
+    __nv_fp8_e4m3* A_padded;   // Padded copy if M < TILE_M (else nullptr)
+    const __nv_fp8_e4m3* A_tma; // Points to A or A_padded
+    TmaDescriptor* d_desc_A;
+    TmaDescriptor* d_desc_B;
+    const half* bias;
+    GemmEpilogue epilogue;
+    dim3 grid;
+    dim3 block;
+    size_t smem_size;
+    int M, N, K;
+};
+
+Fp8GemmPlan* create_fp8_gemm_plan(
+    const __nv_fp8_e4m3* A,
+    const __nv_fp8_e4m3* B,
+    int M, int N, int K,
+    const half* bias,
+    GemmEpilogue epilogue
+) {
+    auto* plan = new Fp8GemmPlan();
+    plan->M = M;
+    plan->N = N;
+    plan->K = K;
+    plan->bias = bias;
+    plan->epilogue = epilogue;
+
+    // Pad M if smaller than tile
+    plan->A_tma = A;
+    plan->A_padded = nullptr;
+    int M_tma = M;
+    if (M < Config::TILE_M) {
+        M_tma = Config::TILE_M;
+        cudaMalloc(&plan->A_padded, (size_t)M_tma * K * sizeof(__nv_fp8_e4m3));
+        cudaMemset(plan->A_padded, 0, (size_t)M_tma * K * sizeof(__nv_fp8_e4m3));
+        cudaMemcpy(plan->A_padded, A, (size_t)M * K * sizeof(__nv_fp8_e4m3),
+                   cudaMemcpyDeviceToDevice);
+        plan->A_tma = plan->A_padded;
+    }
+
+    // TMA descriptors
+    TmaDescriptor h_desc_A, h_desc_B;
+    create_tma_desc_2d(&h_desc_A, plan->A_tma, CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                       M_tma, K, Config::TILE_M, Config::TILE_K, TmaSwizzle::B64);
+    create_tma_desc_2d(&h_desc_B, B, CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                       K, N, Config::TILE_K, Config::TILE_N, TmaSwizzle::B128);
+
+    cudaMalloc(&plan->d_desc_A, sizeof(TmaDescriptor));
+    cudaMalloc(&plan->d_desc_B, sizeof(TmaDescriptor));
+    cudaMemcpy(plan->d_desc_A, &h_desc_A, sizeof(TmaDescriptor), cudaMemcpyHostToDevice);
+    cudaMemcpy(plan->d_desc_B, &h_desc_B, sizeof(TmaDescriptor), cudaMemcpyHostToDevice);
+
+    plan->grid = dim3((N + Config::TILE_N - 1) / Config::TILE_N,
+                      (M + Config::TILE_M - 1) / Config::TILE_M);
+    plan->block = dim3(Config::BLOCK_SIZE);
+    plan->smem_size = sizeof(SmemLayout);
+
+    cudaFuncSetAttribute(gemm_fp8_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, plan->smem_size);
+
+    cudaDeviceSynchronize();
+    return plan;
+}
+
+void execute_fp8_gemm(Fp8GemmPlan* plan, half* C, cudaStream_t stream) {
+    cudaLaunchConfig_t launch_config = {};
+    launch_config.gridDim = plan->grid;
+    launch_config.blockDim = plan->block;
+    launch_config.dynamicSmemBytes = plan->smem_size;
+    launch_config.stream = stream;
+
+    cudaLaunchAttribute launch_attrs[1];
+    launch_attrs[0].id = cudaLaunchAttributeClusterDimension;
+    launch_attrs[0].val.clusterDim.x = 1;
+    launch_attrs[0].val.clusterDim.y = 1;
+    launch_attrs[0].val.clusterDim.z = 1;
+    launch_config.attrs = launch_attrs;
+    launch_config.numAttrs = 1;
+
+    cudaLaunchKernelEx(&launch_config, gemm_fp8_kernel,
+        plan->d_desc_A, plan->d_desc_B, C,
+        plan->M, plan->N, plan->K, plan->bias, plan->epilogue);
+}
+
+void destroy_fp8_gemm_plan(Fp8GemmPlan* plan) {
+    if (!plan) return;
+    if (plan->A_padded) cudaFree(plan->A_padded);
+    cudaFree(plan->d_desc_A);
+    cudaFree(plan->d_desc_B);
+    delete plan;
+}
+
 }  // namespace blaze

@@ -339,4 +339,119 @@ void launch_gemm_fp4(
     if (A_scales_padded) cudaFreeAsync(A_scales_padded, stream);
 }
 
+// ---------------------------------------------------------------------------
+// Prepare/execute API
+// ---------------------------------------------------------------------------
+
+struct Fp4GemmPlan {
+    uint8_t* A_data_padded;           // Padded A data if M < TILE_M (else nullptr)
+    __nv_fp8_e4m3* A_scales_padded;   // Padded A scales if M < TILE_M (else nullptr)
+    const __nv_fp8_e4m3* A_scales_ptr;
+    const __nv_fp8_e4m3* B_scales_ptr;
+    TmaDescriptor* d_descs;           // Device TMA descriptors [A_data, B_data]
+    float scale_A;
+    float scale_B;
+    const half* bias;
+    Fp4Epilogue epilogue;
+    dim3 grid;
+    dim3 block;
+    size_t smem_size;
+    int M, N, K;
+};
+
+Fp4GemmPlan* create_fp4_gemm_plan(
+    const Fp4WeightTensor& A,
+    const Fp4WeightTensor& B,
+    int M, int N, int K,
+    const half* bias,
+    Fp4Epilogue epilogue
+) {
+    auto* plan = new Fp4GemmPlan();
+    plan->M = M;
+    plan->N = N;
+    plan->K = K;
+    plan->scale_A = A.tensor_scale;
+    plan->scale_B = B.tensor_scale;
+    plan->B_scales_ptr = B.block_scales;
+    plan->bias = bias;
+    plan->epilogue = epilogue;
+
+    // Pad M if smaller than tile
+    const uint8_t* A_data_tma = A.data;
+    plan->A_scales_ptr = A.block_scales;
+    plan->A_data_padded = nullptr;
+    plan->A_scales_padded = nullptr;
+    int M_tma = M;
+
+    if (M < Config::TILE_M) {
+        M_tma = Config::TILE_M;
+        size_t data_bytes = (size_t)M_tma * K / 2;
+        size_t scale_count = (size_t)M_tma * K / FP4_BLOCK_SIZE;
+        cudaMalloc(&plan->A_data_padded, data_bytes);
+        cudaMalloc(&plan->A_scales_padded, scale_count * sizeof(__nv_fp8_e4m3));
+        cudaMemset(plan->A_data_padded, 0, data_bytes);
+        cudaMemset(plan->A_scales_padded, 0, scale_count * sizeof(__nv_fp8_e4m3));
+        cudaMemcpy(plan->A_data_padded, A.data, (size_t)M * K / 2,
+                   cudaMemcpyDeviceToDevice);
+        cudaMemcpy(plan->A_scales_padded, A.block_scales,
+                   (size_t)M * K / FP4_BLOCK_SIZE * sizeof(__nv_fp8_e4m3),
+                   cudaMemcpyDeviceToDevice);
+        A_data_tma = plan->A_data_padded;
+        plan->A_scales_ptr = plan->A_scales_padded;
+    }
+
+    // TMA descriptors for packed data only
+    TmaDescriptor h_desc_A_data, h_desc_B_data;
+    create_tma_desc_2d(&h_desc_A_data, A_data_tma, CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                       M_tma, K / 2, Config::TILE_M, Config::TILE_K / 2, TmaSwizzle::B64);
+    create_tma_desc_2d(&h_desc_B_data, B.data, CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                       K, N / 2, Config::TILE_K, Config::TILE_N / 2, TmaSwizzle::B64);
+
+    cudaMalloc(&plan->d_descs, 2 * sizeof(TmaDescriptor));
+    cudaMemcpy(plan->d_descs,     &h_desc_A_data, sizeof(TmaDescriptor), cudaMemcpyHostToDevice);
+    cudaMemcpy(plan->d_descs + 1, &h_desc_B_data, sizeof(TmaDescriptor), cudaMemcpyHostToDevice);
+
+    plan->grid = dim3((N + Config::TILE_N - 1) / Config::TILE_N,
+                      (M + Config::TILE_M - 1) / Config::TILE_M);
+    plan->block = dim3(Config::BLOCK_SIZE);
+    plan->smem_size = sizeof(Fp4SmemLayout);
+
+    cudaFuncSetAttribute(gemm_fp4_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, plan->smem_size);
+
+    cudaDeviceSynchronize();
+    return plan;
+}
+
+void execute_fp4_gemm(Fp4GemmPlan* plan, half* C, cudaStream_t stream) {
+    cudaLaunchConfig_t launch_config = {};
+    launch_config.gridDim = plan->grid;
+    launch_config.blockDim = plan->block;
+    launch_config.dynamicSmemBytes = plan->smem_size;
+    launch_config.stream = stream;
+
+    cudaLaunchAttribute launch_attrs[1];
+    launch_attrs[0].id = cudaLaunchAttributeClusterDimension;
+    launch_attrs[0].val.clusterDim.x = 1;
+    launch_attrs[0].val.clusterDim.y = 1;
+    launch_attrs[0].val.clusterDim.z = 1;
+    launch_config.attrs = launch_attrs;
+    launch_config.numAttrs = 1;
+
+    cudaLaunchKernelEx(&launch_config, gemm_fp4_kernel,
+        plan->d_descs, plan->d_descs + 1,
+        plan->A_scales_ptr, plan->B_scales_ptr,
+        C, plan->M, plan->N, plan->K,
+        plan->scale_A, plan->scale_B,
+        plan->bias, plan->epilogue);
+}
+
+void destroy_fp4_gemm_plan(Fp4GemmPlan* plan) {
+    if (!plan) return;
+    if (plan->A_data_padded) cudaFree(plan->A_data_padded);
+    if (plan->A_scales_padded) cudaFree(plan->A_scales_padded);
+    cudaFree(plan->d_descs);
+    delete plan;
+}
+
 }  // namespace blaze

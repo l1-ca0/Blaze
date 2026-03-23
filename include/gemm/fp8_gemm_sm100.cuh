@@ -70,4 +70,32 @@ void launch_gemm_fp8(
     cudaStream_t stream = 0
 );
 
+// ---------------------------------------------------------------------------
+// Prepare/execute API — pre-allocates workspace and TMA descriptors once
+// so the hot path (execute) only launches the kernel with zero allocations.
+// ---------------------------------------------------------------------------
+
+struct Fp8GemmPlan;
+
+/**
+ * Create a reusable plan for FP8 GEMM with fixed A, B, and dimensions.
+ * Performs M-padding and TMA descriptor creation.
+ */
+Fp8GemmPlan* create_fp8_gemm_plan(
+    const __nv_fp8_e4m3* A,
+    const __nv_fp8_e4m3* B,
+    int M, int N, int K,
+    const half* bias = nullptr,
+    GemmEpilogue epilogue = GemmEpilogue::NONE
+);
+
+/**
+ * Execute a prepared FP8 GEMM plan. Only launches the kernel — no
+ * allocations or TMA setup on this path.
+ */
+void execute_fp8_gemm(Fp8GemmPlan* plan, half* C, cudaStream_t stream = 0);
+
+/** Free all resources held by an FP8 GEMM plan. */
+void destroy_fp8_gemm_plan(Fp8GemmPlan* plan);
+
 }  // namespace blaze

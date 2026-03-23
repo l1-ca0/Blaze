@@ -106,4 +106,34 @@ void launch_fused_gate_up(
     cudaStream_t stream = 0
 );
 
+// ---------------------------------------------------------------------------
+// Prepare/execute API — pre-allocates workspace and TMA descriptors once
+// so the hot path (execute) only launches the kernel with zero allocations.
+// ---------------------------------------------------------------------------
+
+struct MixedGemmPlan;
+
+/**
+ * Create a reusable plan for mixed GEMM with fixed A, B, and dimensions.
+ * Performs FP16→E4M3 conversion, M-padding, and TMA descriptor creation.
+ * The returned plan can be executed many times with different C pointers.
+ */
+MixedGemmPlan* create_mixed_gemm_plan(
+    const half* A,
+    const Fp4WeightTensor& B,
+    int M, int N, int K,
+    const half* bias = nullptr,
+    const half* residual = nullptr,
+    MixedEpilogue epilogue = MixedEpilogue::NONE
+);
+
+/**
+ * Execute a prepared mixed GEMM plan. Only launches the kernel — no
+ * allocations, TMA setup, or data conversions on this path.
+ */
+void execute_mixed_gemm(MixedGemmPlan* plan, half* C, cudaStream_t stream = 0);
+
+/** Free all resources held by a mixed GEMM plan. */
+void destroy_mixed_gemm_plan(MixedGemmPlan* plan);
+
 }  // namespace blaze

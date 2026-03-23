@@ -102,4 +102,32 @@ void launch_gemm_fp4(
     cudaStream_t stream = 0
 );
 
+// ---------------------------------------------------------------------------
+// Prepare/execute API — pre-allocates workspace and TMA descriptors once
+// so the hot path (execute) only launches the kernel with zero allocations.
+// ---------------------------------------------------------------------------
+
+struct Fp4GemmPlan;
+
+/**
+ * Create a reusable plan for FP4 GEMM with fixed A, B, and dimensions.
+ * Performs M-padding and TMA descriptor creation.
+ */
+Fp4GemmPlan* create_fp4_gemm_plan(
+    const Fp4WeightTensor& A,
+    const Fp4WeightTensor& B,
+    int M, int N, int K,
+    const half* bias = nullptr,
+    Fp4Epilogue epilogue = Fp4Epilogue::NONE
+);
+
+/**
+ * Execute a prepared FP4 GEMM plan. Only launches the kernel — no
+ * allocations or TMA setup on this path.
+ */
+void execute_fp4_gemm(Fp4GemmPlan* plan, half* C, cudaStream_t stream = 0);
+
+/** Free all resources held by an FP4 GEMM plan. */
+void destroy_fp4_gemm_plan(Fp4GemmPlan* plan);
+
 }  // namespace blaze
