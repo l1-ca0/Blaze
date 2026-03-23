@@ -45,12 +45,10 @@ struct Fp4GemmConfig {
     static constexpr int SMEM_A_SCALE_BYTES = TILE_M * A_SCALE_COLS;  // 1024
     static constexpr int SMEM_B_SCALE_BYTES = TILE_K * B_SCALE_COLS;  // 1024
 
-    static constexpr int SMEM_C_BYTES = TILE_M * TILE_N * sizeof(float);  // 64 KB
-
+    // No SMEM C staging — epilogue reads TMEM directly to registers.
     static constexpr int TOTAL_SMEM_BYTES =
         PIPELINE_STAGES * (SMEM_A_DATA_BYTES + SMEM_B_DATA_BYTES +
-                           SMEM_A_SCALE_BYTES + SMEM_B_SCALE_BYTES) +
-        SMEM_C_BYTES;
+                           SMEM_A_SCALE_BYTES + SMEM_B_SCALE_BYTES);
 
     static constexpr int TMEM_COLUMNS = TILE_N;
 };

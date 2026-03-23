@@ -5,8 +5,8 @@
  * Warp-specialized, 2-stage double-buffered TMA pipeline:
  *   Warp 0: MMA consumer  (tcgen05.mma, E4M3 × E4M3, FP32 accumulator in TMEM)
  *   Warp 1: TMA producer  (async bulk loads of A and B tiles via TMA)
- *   Warp 2: Idle
- *   Warp 3: Epilogue      (TMEM → SMEM → global, optional bias/activation fusion)
+ *   Warp 2-3: Idle during K-loop
+ *   All warps: Epilogue   (TMEM → registers → global, vectorized uint4 stores)
  *
  * Tile: 128×128×64 (M×N×K), K_PER_MMA=32 (2 inner iterations per tile).
  * Inputs: E4M3 (FP8), Accumulator: FP32 in TMEM, Output: FP16.
@@ -26,13 +26,13 @@ struct Fp8GemmConfig {
     static constexpr int BLOCK_SIZE = 128;         // 4 warps
     static constexpr int PIPELINE_STAGES = 2;
 
-    // Per-stage SMEM: A (8 KB) + B (8 KB), double-buffered. C staging (64 KB).
+    // Per-stage SMEM: A (8 KB) + B (8 KB), double-buffered.
+    // No SMEM C staging — epilogue reads TMEM directly to registers.
     static constexpr int SMEM_A_BYTES = TILE_M * TILE_K * sizeof(__nv_fp8_e4m3);
     static constexpr int SMEM_B_BYTES = TILE_K * TILE_N * sizeof(__nv_fp8_e4m3);
-    static constexpr int SMEM_C_BYTES = TILE_M * TILE_N * sizeof(float);
 
     static constexpr int TOTAL_SMEM_BYTES =
-        PIPELINE_STAGES * (SMEM_A_BYTES + SMEM_B_BYTES) + SMEM_C_BYTES;
+        PIPELINE_STAGES * (SMEM_A_BYTES + SMEM_B_BYTES);
 
     static constexpr int TMEM_COLUMNS = TILE_N;
 };

@@ -40,13 +40,15 @@ struct MixedGemmConfig {
 
     // Per-stage SMEM for B packed data + block scales
     static constexpr int SMEM_B_DATA_BYTES  = TILE_K * TILE_N / 2;            // 4 KB
-    static constexpr int SMEM_B_SCALE_BYTES = TILE_K * (TILE_N / FP4_BLOCK_SIZE);  // 512
 
-    static constexpr int SMEM_C_BYTES = TILE_M * TILE_N * sizeof(float);       // 64 KB
+    // B block scales: 1 E4M3 byte per FP4_BLOCK_SIZE (16) elements along N.
+    // Loaded via vectorized global loads (uint2 per row = 8 bytes).
+    static constexpr int SCALE_COLS = TILE_N / FP4_BLOCK_SIZE;                // 8
+    static constexpr int SMEM_B_SCALE_BYTES = TILE_K * SCALE_COLS;            // 512
 
+    // No SMEM C staging — epilogue reads TMEM directly to registers.
     static constexpr int TOTAL_SMEM_BYTES =
-        PIPELINE_STAGES * (SMEM_A_BYTES + SMEM_B_DATA_BYTES + SMEM_B_SCALE_BYTES) +
-        SMEM_C_BYTES;
+        PIPELINE_STAGES * (SMEM_A_BYTES + SMEM_B_DATA_BYTES + SMEM_B_SCALE_BYTES);
 
     static constexpr int TMEM_COLUMNS = TILE_N;
 };

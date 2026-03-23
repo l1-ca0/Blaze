@@ -7,13 +7,20 @@
  *
  * Warp-specialized, 2-stage double-buffered pipeline:
  *   Warp 0: MMA consumer  (tcgen05.mma.kind::f8f6f4, E2M1 × E2M1)
- *   Warp 1: TMA producer  (async bulk loads for packed data; global loads for scales)
- *   Warp 2: Idle
- *   Warp 3: Epilogue      (TMEM → SMEM → global store with tensor scale)
+ *   Warp 1: TMA producer  (async bulk loads for A_data + B_data)
+ *   Warp 2: A_scale loader (vectorized uint2 global loads for A block scales)
+ *   Warp 3: B_scale loader (vectorized uint2 global loads for B block scales)
+ *   All warps: Epilogue   (TMEM → registers → global, no SMEM staging)
  *
  * Tile: 128×128×128 (M×N×K). K_PER_MMA=64, 2 inner iterations per tile.
- * Packed data loaded via TMA; block scales loaded via warp-cooperative
- * global memory reads (scale tiles are too narrow for TMA's 16-byte minimum).
+ * Packed data loaded via TMA with B64 swizzle; block scales loaded
+ * concurrently by dedicated warps via vectorized global loads.
+ *
+ * Synchronization: mbar_load init=3 (3 arrivals required):
+ *   - Warp 1: mbarrier_expect_tx (implicit arrival, counts as 1) + TMA loads
+ *   - Warp 2: mbarrier_arrive after A_scales written to SMEM
+ *   - Warp 3: mbarrier_arrive after B_scales written to SMEM
+ * Barrier flips only when all 3 arrivals AND all TMA bytes are received.
  */
 
 #include "gemm/fp4_gemm_sm100.cuh"
@@ -29,6 +36,7 @@ namespace blaze {
 
 using Config = Fp4GemmConfig;
 
+// SMEM layout — scales loaded by dedicated warps 2/3 concurrently with TMA.
 struct __align__(128) Fp4SmemLayout {
     alignas(8) uint64_t mbar_load[Config::PIPELINE_STAGES];
     alignas(8) uint64_t mbar_mma[Config::PIPELINE_STAGES];
@@ -39,21 +47,22 @@ struct __align__(128) Fp4SmemLayout {
     uint8_t B_data[Config::PIPELINE_STAGES][Config::TILE_K * Config::TILE_N / 2];
     __nv_fp8_e4m3 A_scales[Config::PIPELINE_STAGES][Config::SMEM_A_SCALE_BYTES];
     __nv_fp8_e4m3 B_scales[Config::PIPELINE_STAGES][Config::SMEM_B_SCALE_BYTES];
-    float C[Config::TILE_M * Config::TILE_N];
+    // No float C[] — epilogue reads TMEM directly to registers
 };
 
+/**
+ * TMA producer (warp 1): loads A_data and B_data via TMA only.
+ * Scale loading is handled by warps 2 and 3 concurrently.
+ * mbarrier_expect_tx counts as 1 implicit arrival (no explicit arrive needed).
+ */
 __device__ __forceinline__
 void fp4_tma_producer(
     Fp4SmemLayout* smem,
     const TmaDescriptor* desc_A_data,
     const TmaDescriptor* desc_B_data,
-    const __nv_fp8_e4m3* global_A_scales,
-    const __nv_fp8_e4m3* global_B_scales,
-    int bm, int bn, int M, int N, int K, int lane_id
+    int bm, int bn, int K, int lane_id
 ) {
     const int num_k_tiles = K / Config::TILE_K;
-    const int a_scale_stride = K / FP4_BLOCK_SIZE;
-    const int b_scale_stride = N / FP4_BLOCK_SIZE;
 
     for (int k_tile = 0; k_tile < num_k_tiles; k_tile++) {
         int stage = k_tile % Config::PIPELINE_STAGES;
@@ -73,29 +82,80 @@ void fp4_tma_producer(
             tma_load_2d(smem->B_data[stage], desc_B_data,
                         bn / 2, k_offset, &smem->mbar_load[stage]);
         }
+        // No explicit mbarrier_arrive — expect_tx is the implicit arrival for warp 1.
+    }
+}
 
-        // Warp-cooperative load of A block scales from global memory.
-        {
-            const int a_scale_col_start = k_offset / FP4_BLOCK_SIZE;
-            const int total_a = Config::SMEM_A_SCALE_BYTES;
-            for (int i = lane_id; i < total_a; i += 32) {
-                int row = i / Config::A_SCALE_COLS;
-                int col = i % Config::A_SCALE_COLS;
-                int global_idx = (bm + row) * a_scale_stride + (a_scale_col_start + col);
-                smem->A_scales[stage][i] = global_A_scales[global_idx];
-            }
+/**
+ * A_scale loader (warp 2): vectorized uint2 global loads for A block scales.
+ * 128 rows × 8 bytes/row = 1024 bytes per stage. 32 threads × 4 iters.
+ * Arrives on mbar_load after SMEM writes complete.
+ */
+__device__ __forceinline__
+void fp4_a_scale_loader(
+    Fp4SmemLayout* smem,
+    const __nv_fp8_e4m3* global_A_scales,
+    int bm, int K, int lane_id
+) {
+    const int num_k_tiles = K / Config::TILE_K;
+    const int a_scale_stride = K / FP4_BLOCK_SIZE;
+
+    for (int k_tile = 0; k_tile < num_k_tiles; k_tile++) {
+        int stage = k_tile % Config::PIPELINE_STAGES;
+        int k_offset = k_tile * Config::TILE_K;
+
+        if (k_tile >= Config::PIPELINE_STAGES) {
+            mbarrier_wait(&smem->mbar_mma[stage],
+                         ((k_tile / Config::PIPELINE_STAGES) + 1) & 1);
         }
 
-        // Warp-cooperative load of B block scales from global memory.
-        {
-            const int b_scale_col_start = bn / FP4_BLOCK_SIZE;
-            const int total_b = Config::SMEM_B_SCALE_BYTES;
-            for (int i = lane_id; i < total_b; i += 32) {
-                int row = i / Config::B_SCALE_COLS;
-                int col = i % Config::B_SCALE_COLS;
-                int global_idx = (k_offset + row) * b_scale_stride + (b_scale_col_start + col);
-                smem->B_scales[stage][i] = global_B_scales[global_idx];
-            }
+        const int a_scale_col_start = k_offset / FP4_BLOCK_SIZE;
+        for (int r = lane_id; r < Config::TILE_M; r += 32) {
+            *reinterpret_cast<uint2*>(&smem->A_scales[stage][r * Config::A_SCALE_COLS]) =
+                *reinterpret_cast<const uint2*>(
+                    &global_A_scales[(bm + r) * a_scale_stride + a_scale_col_start]);
+        }
+        __syncwarp();
+
+        if (lane_id == 0) {
+            mbarrier_arrive(&smem->mbar_load[stage]);
+        }
+    }
+}
+
+/**
+ * B_scale loader (warp 3): vectorized uint2 global loads for B block scales.
+ * 128 rows × 8 bytes/row = 1024 bytes per stage. 32 threads × 4 iters.
+ * Arrives on mbar_load after SMEM writes complete.
+ */
+__device__ __forceinline__
+void fp4_b_scale_loader(
+    Fp4SmemLayout* smem,
+    const __nv_fp8_e4m3* global_B_scales,
+    int bn, int N, int K, int lane_id
+) {
+    const int num_k_tiles = K / Config::TILE_K;
+    const int b_scale_stride = N / FP4_BLOCK_SIZE;
+    const int b_scale_col_start = bn / FP4_BLOCK_SIZE;
+
+    for (int k_tile = 0; k_tile < num_k_tiles; k_tile++) {
+        int stage = k_tile % Config::PIPELINE_STAGES;
+        int k_offset = k_tile * Config::TILE_K;
+
+        if (k_tile >= Config::PIPELINE_STAGES) {
+            mbarrier_wait(&smem->mbar_mma[stage],
+                         ((k_tile / Config::PIPELINE_STAGES) + 1) & 1);
+        }
+
+        for (int r = lane_id; r < Config::TILE_K; r += 32) {
+            *reinterpret_cast<uint2*>(&smem->B_scales[stage][r * Config::B_SCALE_COLS]) =
+                *reinterpret_cast<const uint2*>(
+                    &global_B_scales[(k_offset + r) * b_scale_stride + b_scale_col_start]);
+        }
+        __syncwarp();
+
+        if (lane_id == 0) {
+            mbarrier_arrive(&smem->mbar_load[stage]);
         }
     }
 }
@@ -149,43 +209,68 @@ void fp4_mma_consumer(Fp4SmemLayout* smem, tmem_addr_t tmem_addr, int K) {
     }
 }
 
+/**
+ * Direct TMEM → register → global epilogue for FP4 GEMM with vectorized stores.
+ * All 4 warps participate. Each warp reads its own 32-row TMEM slice.
+ * Packs 8 halves into uint4 for 16-byte aligned stores (8× less L2 traffic).
+ */
 __device__ __forceinline__
-void fp4_epilogue(
-    Fp4SmemLayout* smem, tmem_addr_t tmem_addr,
+void fp4_epilogue_direct(
+    tmem_addr_t tmem_addr,
     half* C_global, int bm, int bn, int M, int N,
     float scale_A, float scale_B,
-    const half* bias, Fp4Epilogue epilogue_op, int tid
+    const half* bias, Fp4Epilogue epilogue_op,
+    int warp_id, int lane_id
 ) {
-    int local_tid = tid % 32;
+    asm volatile("tcgen05.fence::after_thread_sync;\n" ::: "memory");
+
     float combined_scale = scale_A * scale_B;
-    const int elems_per_thread = (Config::TILE_M * Config::TILE_N) / 32;
+    int row = warp_id * 32 + lane_id;
+    int global_row = bm + row;
 
-    for (int i = 0; i < elems_per_thread; i++) {
-        int idx = local_tid + i * 32;
-        int row = idx / Config::TILE_N;
-        int col = idx % Config::TILE_N;
-        int global_row = bm + row;
-        int global_col = bn + col;
+    for (int cg = 0; cg < Config::TILE_N / 8; cg++) {
+        float vals[8];
+        tmem_load_8xf32(vals, tmem_addr, cg * 8);
+        tmem_wait_ld();
 
-        if (global_row < M && global_col < N) {
-            float val = smem->C[idx] * combined_scale;
+        if (global_row < M) {
+            int global_col_base = bn + cg * 8;
+
+            // Apply combined scale and epilogue to all 8 values
+            for (int c = 0; c < 8; c++) vals[c] *= combined_scale;
 
             switch (epilogue_op) {
                 case Fp4Epilogue::BIAS:
-                    val += __half2float(bias[global_col]);
+                    for (int c = 0; c < 8; c++)
+                        vals[c] += __half2float(bias[global_col_base + c]);
                     break;
                 case Fp4Epilogue::SILU:
-                    val = val / (1.0f + expf(-val));
+                    for (int c = 0; c < 8; c++)
+                        vals[c] = vals[c] / (1.0f + expf(-vals[c]));
                     break;
                 case Fp4Epilogue::BIAS_SILU:
-                    val += __half2float(bias[global_col]);
-                    val = val / (1.0f + expf(-val));
+                    for (int c = 0; c < 8; c++) {
+                        vals[c] += __half2float(bias[global_col_base + c]);
+                        vals[c] = vals[c] / (1.0f + expf(-vals[c]));
+                    }
                     break;
                 default:
                     break;
             }
 
-            C_global[global_row * N + global_col] = __float2half(val);
+            // Pack 8 halves into uint4 for vectorized 16-byte store
+            half h[8];
+            for (int c = 0; c < 8; c++) h[c] = __float2half(vals[c]);
+
+            if (global_col_base + 7 < N) {
+                *reinterpret_cast<uint4*>(&C_global[global_row * N + global_col_base]) =
+                    *reinterpret_cast<uint4*>(h);
+            } else {
+                for (int c = 0; c < 8; c++) {
+                    if (global_col_base + c < N)
+                        C_global[global_row * N + global_col_base + c] = h[c];
+                }
+            }
         }
     }
 }
@@ -214,7 +299,8 @@ gemm_fp4_kernel(
 
     if (tid == 0) {
         for (int s = 0; s < Config::PIPELINE_STAGES; s++) {
-            mbarrier_init(&smem->mbar_load[s], 1);
+            // mbar_load: 3 arrivals = expect_tx (warp 1) + arrive (warp 2) + arrive (warp 3)
+            mbarrier_init(&smem->mbar_load[s], 3);
             mbarrier_init(&smem->mbar_mma[s], 1);
         }
     }
@@ -227,28 +313,28 @@ gemm_fp4_kernel(
     __syncthreads();
     tmem_addr = smem->tmem_addr;
 
+    // K-loop: all 4 warps have dedicated roles
     switch (warp_id) {
         case 0:
             fp4_mma_consumer(smem, tmem_addr, K);
             break;
         case 1:
             fp4_tma_producer(smem, desc_A_data, desc_B_data,
-                            global_A_scales, global_B_scales,
-                            bm, bn, M, N, K, lane_id);
+                            bm, bn, K, lane_id);
             break;
         case 2:
+            fp4_a_scale_loader(smem, global_A_scales, bm, K, lane_id);
+            break;
         case 3:
+            fp4_b_scale_loader(smem, global_B_scales, bn, N, K, lane_id);
             break;
     }
 
+    // Wait for MMA completion, then all warps do TMEM → register → global
     __syncthreads();
-    tmem_store_to_smem_warp(smem->C, tmem_addr, Config::TILE_N, warp_id);
-    __syncthreads();
-
-    if (warp_id == 3) {
-        fp4_epilogue(smem, tmem_addr, C, bm, bn, M, N,
-                    scale_A, scale_B, bias, epilogue_op, tid);
-    }
+    fp4_epilogue_direct(tmem_addr, C, bm, bn, M, N,
+                       scale_A, scale_B, bias, epilogue_op,
+                       warp_id, lane_id);
 
     __syncthreads();
     if (warp_id == 0) {

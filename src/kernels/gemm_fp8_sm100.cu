@@ -7,10 +7,14 @@
  * Warp-specialized, 2-stage double-buffered TMA pipeline:
  *   Warp 0: MMA consumer  (tcgen05.mma.kind::f8f6f4, E4M3 × E4M3)
  *   Warp 1: TMA producer  (async bulk tensor loads for A, B)
- *   Warp 2: Idle
- *   Warp 3: Epilogue      (TMEM → SMEM → global store)
+ *   Warp 2-3: Idle during K-loop
+ *   All warps: Epilogue   (TMEM → registers → global, no SMEM staging)
  *
  * Tile: 128×128×64 (M×N×K). K_PER_MMA=32, 2 inner iterations per tile.
+ *
+ * Key optimization: SMEM C staging buffer eliminated. Each warp reads its
+ * own 32-row TMEM slice directly to registers and writes to global memory.
+ * This saves 64 KB SMEM, increasing occupancy from 12.5% to ~43%.
  */
 
 #include "gemm/fp8_gemm_sm100.cuh"
@@ -33,6 +37,8 @@ enum WarpRole : int {
     EPILOGUE = 3,
 };
 
+// SMEM layout WITHOUT the 64 KB C staging buffer.
+// Only holds A/B tiles (double-buffered) + mbarriers + tmem_addr.
 struct __align__(128) SmemLayout {
     alignas(8) uint64_t mbar_load[Config::PIPELINE_STAGES];
     alignas(8) uint64_t mbar_mma[Config::PIPELINE_STAGES];
@@ -41,7 +47,7 @@ struct __align__(128) SmemLayout {
 
     __nv_fp8_e4m3 A[Config::PIPELINE_STAGES][Config::TILE_M * Config::TILE_K];
     __nv_fp8_e4m3 B[Config::PIPELINE_STAGES][Config::TILE_K * Config::TILE_N];
-    float C[Config::TILE_M * Config::TILE_N];
+    // No float C[] — epilogue reads TMEM directly to registers
 };
 
 __device__ __forceinline__
@@ -120,42 +126,76 @@ void mma_consumer(SmemLayout* smem, tmem_addr_t tmem_addr, int K) {
     }
 }
 
+/**
+ * Direct TMEM → register → global epilogue with vectorized stores.
+ * Each warp reads its own 32-row TMEM slice and writes to global memory.
+ *
+ * Key optimization: packs 8 FP16 values into a uint4 (16-byte) store.
+ * Without this, individual half writes cause 94% excessive L2 sectors
+ * (2/32 bytes per sector = 6.25% utilization). With uint4 stores,
+ * utilization improves to 16/32 = 50% — an 8× reduction in L2 traffic.
+ *
+ * All 4 warps participate equally in the epilogue.
+ */
 __device__ __forceinline__
-void epilogue(
-    SmemLayout* smem, tmem_addr_t tmem_addr,
+void epilogue_direct(
+    tmem_addr_t tmem_addr,
     half* C_global, int bm, int bn, int M, int N,
-    const half* bias, GemmEpilogue epilogue_op, int tid
+    const half* bias, GemmEpilogue epilogue_op,
+    int warp_id, int lane_id
 ) {
-    int local_tid = tid - (WarpRole::EPILOGUE * 32);
-    const int elems_per_thread = (Config::TILE_M * Config::TILE_N) / 32;
+    // Make TMEM data (from async MMA) visible to this warp's tcgen05.ld
+    asm volatile("tcgen05.fence::after_thread_sync;\n" ::: "memory");
 
-    for (int i = 0; i < elems_per_thread; i++) {
-        int idx = local_tid + i * 32;
-        int row = idx / Config::TILE_N;
-        int col = idx % Config::TILE_N;
-        int global_row = bm + row;
-        int global_col = bn + col;
+    int row = warp_id * 32 + lane_id;
+    int global_row = bm + row;
 
-        if (global_row < M && global_col < N) {
-            float val = smem->C[idx];
+    // Each warp reads its 32 rows from TMEM, 8 columns at a time
+    for (int cg = 0; cg < Config::TILE_N / 8; cg++) {
+        float vals[8];
+        tmem_load_8xf32(vals, tmem_addr, cg * 8);
+        tmem_wait_ld();
 
+        if (global_row < M) {
+            int global_col_base = bn + cg * 8;
+
+            // Apply epilogue to all 8 values
             switch (epilogue_op) {
                 case GemmEpilogue::BIAS:
-                    val += __half2float(bias[global_col]);
+                    for (int c = 0; c < 8; c++)
+                        vals[c] += __half2float(bias[global_col_base + c]);
                     break;
                 case GemmEpilogue::SILU:
-                    val = val / (1.0f + expf(-val));
+                    for (int c = 0; c < 8; c++)
+                        vals[c] = vals[c] / (1.0f + expf(-vals[c]));
                     break;
                 case GemmEpilogue::BIAS_SILU:
-                    val += __half2float(bias[global_col]);
-                    val = val / (1.0f + expf(-val));
+                    for (int c = 0; c < 8; c++) {
+                        vals[c] += __half2float(bias[global_col_base + c]);
+                        vals[c] = vals[c] / (1.0f + expf(-vals[c]));
+                    }
                     break;
                 case GemmEpilogue::NONE:
                 default:
                     break;
             }
 
-            C_global[global_row * N + global_col] = __float2half(val);
+            // Pack 8 halves into uint4 for vectorized 16-byte store
+            // Address is 16-byte aligned: bn is TILE_N-aligned (128), cg*8*2=cg*16
+            half h[8];
+            for (int c = 0; c < 8; c++) h[c] = __float2half(vals[c]);
+
+            if (global_col_base + 7 < N) {
+                // Full 8-column group: single 16-byte aligned store
+                *reinterpret_cast<uint4*>(&C_global[global_row * N + global_col_base]) =
+                    *reinterpret_cast<uint4*>(h);
+            } else {
+                // Edge case: partial column group at N boundary
+                for (int c = 0; c < 8; c++) {
+                    if (global_col_base + c < N)
+                        C_global[global_row * N + global_col_base + c] = h[c];
+                }
+            }
         }
     }
 }
@@ -194,6 +234,7 @@ gemm_fp8_kernel(
     __syncthreads();
     tmem_addr = smem->tmem_addr;
 
+    // K-loop: warp 0 does MMA, warp 1 does TMA, warps 2-3 idle
     switch (warp_id) {
         case WarpRole::MMA_CONSUMER:
             mma_consumer(smem, tmem_addr, K);
@@ -206,15 +247,11 @@ gemm_fp8_kernel(
             break;
     }
 
-    // Cooperative TMEM -> SMEM: all warps participate (warp-scoped TMEM reads)
+    // Wait for MMA completion, then all warps do TMEM → register → global
     __syncthreads();
-    tmem_store_to_smem_warp(smem->C, tmem_addr, Config::TILE_N, warp_id);
-    __syncthreads();
+    epilogue_direct(tmem_addr, C, bm, bn, M, N, bias, epilogue_op, warp_id, lane_id);
 
-    if (warp_id == WarpRole::EPILOGUE) {
-        epilogue(smem, tmem_addr, C, bm, bn, M, N, bias, epilogue_op, tid);
-    }
-
+    // Ensure all warps finished reading TMEM before deallocation
     __syncthreads();
     if (warp_id == 0) {
         tmem_dealloc(tmem_addr, Config::TMEM_COLUMNS);

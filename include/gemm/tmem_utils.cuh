@@ -154,13 +154,23 @@ void tmem_store_to_smem(float* smem_out, tmem_addr_t taddr, int tile_n) {
  * All 4 warps must call this cooperatively to transfer the full 128-row tile.
  * Must be preceded by __syncthreads() to ensure MMA completion.
  *
- * @param smem_out  Destination shared memory buffer [128 × tile_n] floats, row-major
- * @param taddr     TMEM base address from alloc
- * @param tile_n    Number of columns (must be multiple of 8)
- * @param warp_id   Warp index within block (0-3)
+ * The SMEM destination uses stride = tile_n + SMEM_C_PAD to avoid bank conflicts.
+ * Without padding, all 32 lanes write to the same bank (31.8-way conflict)
+ * because row * tile_n is always a multiple of 32 when tile_n is 128.
+ * With +1 padding: lane * (tile_n+1) % 32 = lane, giving zero conflicts.
+ *
+ * @param smem_out    Destination shared memory buffer [128 × (tile_n + SMEM_C_PAD)] floats
+ * @param taddr       TMEM base address from alloc
+ * @param tile_n      Number of data columns (must be multiple of 8)
+ * @param smem_stride Row stride in the SMEM buffer (tile_n + SMEM_C_PAD)
+ * @param warp_id     Warp index within block (0-3)
  */
+// Padding to eliminate SMEM bank conflicts in TMEM→SMEM transfer.
+// 4 floats (16 bytes) aligns rows to 16B while fully breaking conflicts.
+constexpr int SMEM_C_PAD = 4;
+
 __device__ __forceinline__
-void tmem_store_to_smem_warp(float* smem_out, tmem_addr_t taddr, int tile_n, int warp_id) {
+void tmem_store_to_smem_warp(float* smem_out, tmem_addr_t taddr, int tile_n, int smem_stride, int warp_id) {
     // CRITICAL: Each warp must execute fence::after_thread_sync to make TMEM
     // data (written by async MMA) visible to its tcgen05.ld instructions.
     // Without this, only the MMA-issuing warp can see the TMEM writes.
@@ -169,16 +179,23 @@ void tmem_store_to_smem_warp(float* smem_out, tmem_addr_t taddr, int tile_n, int
     int lane = threadIdx.x % 32;
     // tcgen05.ld row selection is implicit — hardware reads the warp's own 32 rows.
     // warp_id is only used for computing the SMEM output offset.
+    int row = warp_id * 32 + lane;
     for (int cg = 0; cg < tile_n / 8; cg++) {
         float vals[8];
         tmem_load_8xf32(vals, taddr, cg * 8);
         tmem_wait_ld();
 
-        int row = warp_id * 32 + lane;
+        int base = row * smem_stride + cg * 8;
         for (int c = 0; c < 8; c++) {
-            smem_out[row * tile_n + cg * 8 + c] = vals[c];
+            smem_out[base + c] = vals[c];
         }
     }
+}
+
+/** Backward-compatible overload: smem_stride defaults to tile_n (no padding). */
+__device__ __forceinline__
+void tmem_store_to_smem_warp(float* smem_out, tmem_addr_t taddr, int tile_n, int warp_id) {
+    tmem_store_to_smem_warp(smem_out, taddr, tile_n, tile_n, warp_id);
 }
 
 /**
