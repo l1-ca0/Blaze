@@ -9,6 +9,7 @@
 
 #include "gemm/fp8_gemm_sm100.cuh"
 #include "gemm/fp4_gemm_sm100.cuh"
+#include "gemm/fp4_blkscaled_gemm_sm100.cuh"
 #include "gemm/mixed_gemm_sm100.cuh"
 
 #include <cuda_runtime.h>
@@ -310,6 +311,112 @@ int test_fp4_gemm(cublasHandle_t cublas) {
 }
 
 // ---------------------------------------------------------------------------
+// FP4 Block-Scaled GEMM: NVFP4 × NVFP4 → FP16 (hardware block scales)
+// ---------------------------------------------------------------------------
+
+int test_fp4_blkscaled_gemm(cublasHandle_t cublas) {
+    printf("\n=== FP4 Block-Scaled GEMM Tests (E2M1 x E2M1, hardware block scales) ===\n");
+    int passed = 0;
+    int total = sizeof(llama_shapes) / sizeof(llama_shapes[0]);
+
+    for (int t = 0; t < total; t++) {
+        auto& tc = llama_shapes[t];
+
+        // FP4 TILE_K=128: align K up to tile boundary.
+        int K_aligned = ((tc.K + 127) / 128) * 128;
+
+        printf("  [%d/%d] %s (M=%d, N=%d, K=%d)... ",
+               t + 1, total, tc.name, tc.M, tc.N, K_aligned);
+
+        int a_data_bytes  = tc.M * K_aligned / 2;
+        int a_scale_count = tc.M * K_aligned / blaze::FP4_BLKSCALED_BLOCK_SIZE;
+
+        uint8_t* d_A_data;
+        __nv_fp8_e4m3* d_A_scales;
+        CHECK_CUDA(cudaMalloc(&d_A_data, a_data_bytes));
+        CHECK_CUDA(cudaMalloc(&d_A_scales, a_scale_count * sizeof(__nv_fp8_e4m3)));
+        // Use data=0x22 (E2M1: both nibbles = 0010 = +1.0) and scale=0x38 (E4M3: 1.0)
+        // Expected result per element: 1.0 * 1.0 * 1.0 * 1.0 * K = K
+        // K=11008 < FP16 max 65504, so no overflow.
+        CHECK_CUDA(cudaMemset(d_A_data, 0x22, a_data_bytes));
+        CHECK_CUDA(cudaMemset(d_A_scales, 0x38, a_scale_count));
+
+        blaze::Fp4BlkScaledWeightTensor A_weight;
+        A_weight.data = d_A_data;
+        A_weight.block_scales = d_A_scales;
+        A_weight.tensor_scale = 1.0f;
+        A_weight.rows = tc.M;
+        A_weight.cols = K_aligned;
+
+        int b_data_bytes  = K_aligned * tc.N / 2;
+        int b_scale_count = K_aligned * tc.N / blaze::FP4_BLKSCALED_BLOCK_SIZE;
+
+        uint8_t* d_B_data;
+        __nv_fp8_e4m3* d_B_scales;
+        CHECK_CUDA(cudaMalloc(&d_B_data, b_data_bytes));
+        CHECK_CUDA(cudaMalloc(&d_B_scales, b_scale_count * sizeof(__nv_fp8_e4m3)));
+        CHECK_CUDA(cudaMemset(d_B_data, 0x22, b_data_bytes));
+        CHECK_CUDA(cudaMemset(d_B_scales, 0x38, b_scale_count));
+
+        blaze::Fp4BlkScaledWeightTensor B_weight;
+        B_weight.data = d_B_data;
+        B_weight.block_scales = d_B_scales;
+        B_weight.tensor_scale = 1.0f;
+        B_weight.rows = K_aligned;
+        B_weight.cols = tc.N;
+
+        half* d_C;
+        CHECK_CUDA(cudaMalloc(&d_C, tc.M * tc.N * sizeof(half)));
+
+        blaze::launch_gemm_fp4_blkscaled(A_weight, B_weight, d_C, tc.M, tc.N, K_aligned);
+        CHECK_CUDA(cudaDeviceSynchronize());
+
+        auto* h_C = new half[tc.M * tc.N];
+        CHECK_CUDA(cudaMemcpy(h_C, d_C, tc.M * tc.N * sizeof(half),
+                              cudaMemcpyDeviceToHost));
+
+        // With data=1.0, scale=1.0, tensor_scale=1.0: expected = K_aligned per element
+        float expected = (float)K_aligned;
+        bool no_nan_inf = check_no_nan_inf(h_C, tc.M * tc.N);
+        float max_err = 0.0f;
+        if (no_nan_inf) {
+            for (int i = 0; i < tc.M * tc.N; i++) {
+                float v = __half2float(h_C[i]);
+                float err = fabsf(v - expected) / fmaxf(fabsf(expected), 1.0f);
+                if (err > max_err) max_err = err;
+            }
+        }
+        if (no_nan_inf && max_err < 0.01f) {
+            printf("PASS (expected=%.0f, got=%.0f, max_rel_err=%.4f)\n",
+                   expected, __half2float(h_C[0]), max_err);
+            passed++;
+        } else if (!no_nan_inf) {
+            printf("FAIL — first 4 vals:");
+            for (int i = 0; i < 4 && i < tc.M * tc.N; i++) {
+                float v = __half2float(h_C[i]);
+                if (isnan(v)) printf(" NaN");
+                else if (isinf(v)) printf(" %sInf", v > 0 ? "+" : "-");
+                else printf(" %.4g", v);
+            }
+            printf("\n");
+        } else {
+            printf("FAIL (expected=%.0f, got=%.0f, max_rel_err=%.4f)\n",
+                   expected, __half2float(h_C[0]), max_err);
+        }
+
+        delete[] h_C;
+        CHECK_CUDA(cudaFree(d_A_data));
+        CHECK_CUDA(cudaFree(d_A_scales));
+        CHECK_CUDA(cudaFree(d_B_data));
+        CHECK_CUDA(cudaFree(d_B_scales));
+        CHECK_CUDA(cudaFree(d_C));
+    }
+
+    printf("  FP4 BlkScaled GEMM: %d/%d passed\n", passed, total);
+    return passed == total ? 0 : 1;
+}
+
+// ---------------------------------------------------------------------------
 
 int main() {
     printf("=== Blaze: Phase 1 GEMM Correctness Tests ===\n");
@@ -322,6 +429,7 @@ int main() {
     ret |= test_fp8_gemm(cublas);
     ret |= test_mixed_gemm(cublas);
     ret |= test_fp4_gemm(cublas);
+    ret |= test_fp4_blkscaled_gemm(cublas);
 
     cublasDestroy(cublas);
 

@@ -11,6 +11,7 @@
 
 #include "gemm/fp8_gemm_sm100.cuh"
 #include "gemm/fp4_gemm_sm100.cuh"
+#include "gemm/fp4_blkscaled_gemm_sm100.cuh"
 #include "gemm/mixed_gemm_sm100.cuh"
 
 #include <cuda_runtime.h>
@@ -323,6 +324,63 @@ int main() {
                   pct_cublas, pct_peak);
 
         blaze::destroy_fp4_gemm_plan(plan);
+    }
+
+    // -----------------------------------------------------------------------
+    // FP4 Block-Scaled GEMM (E2M1 × E2M1, hardware block scale application)
+    // -----------------------------------------------------------------------
+    print_header("FP4 BlkScaled GEMM");
+
+    for (int s = 0; s < n_shapes; s++) {
+        auto& sh = shapes[s];
+        int K_aligned = ((sh.K + 127) / 128) * 128;
+
+        blaze::Fp4BlkScaledWeightTensor A_fp4_bs = {
+            d_A_fp4_data, d_A_fp4_scales,
+            1.0f, sh.M, K_aligned
+        };
+        blaze::Fp4BlkScaledWeightTensor B_fp4_bs = {
+            d_B_fp4_data_aligned, d_B_fp4_scales_aligned,
+            1.0f, K_aligned, sh.N
+        };
+
+        auto* plan = blaze::create_fp4_blkscaled_gemm_plan(
+            A_fp4_bs, B_fp4_bs, sh.M, sh.N, K_aligned);
+
+        // Time kernel only
+        for (int i = 0; i < warmup; i++)
+            blaze::execute_fp4_blkscaled_gemm(plan, d_C);
+        CHECK_CUDA(cudaDeviceSynchronize());
+
+        cudaEvent_t start, stop;
+        CHECK_CUDA(cudaEventCreate(&start));
+        CHECK_CUDA(cudaEventCreate(&stop));
+        CHECK_CUDA(cudaEventRecord(start));
+        for (int i = 0; i < iters; i++)
+            blaze::execute_fp4_blkscaled_gemm(plan, d_C);
+        CHECK_CUDA(cudaEventRecord(stop));
+        CHECK_CUDA(cudaEventSynchronize(stop));
+
+        float our_ms;
+        CHECK_CUDA(cudaEventElapsedTime(&our_ms, start, stop));
+        our_ms /= iters;
+        cudaEventDestroy(start);
+        cudaEventDestroy(stop);
+
+        float cublas_ms = time_cublas_fp16(cublas, d_A_fp16, d_B_fp16, d_C_ref,
+                                            sh.M, sh.N, sh.K, warmup, iters);
+
+        double flops = 2.0 * sh.M * sh.N * K_aligned;
+        double our_tflops = flops / (our_ms * 1e-3) / 1e12;
+        double cublas_tflops = flops / (cublas_ms * 1e-3) / 1e12;
+        double pct_cublas = (cublas_tflops > 0) ? (our_tflops / cublas_tflops * 100.0) : 0;
+        double pct_peak = our_tflops / B200_PEAK_FP4_TFLOPS * 100.0;
+
+        print_row(sh.name, sh.M, sh.N, K_aligned,
+                  our_ms, cublas_ms, our_tflops, cublas_tflops,
+                  pct_cublas, pct_peak);
+
+        blaze::destroy_fp4_blkscaled_gemm_plan(plan);
     }
 
     CHECK_CUDA(cudaFree(d_A_fp4_data));
