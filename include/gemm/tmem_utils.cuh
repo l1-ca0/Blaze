@@ -352,4 +352,160 @@ uint32_t make_idesc_f8f6f4(
     return idesc;
 }
 
+// ---------------------------------------------------------------------------
+// Block-scaled MMA helpers 
+// ---------------------------------------------------------------------------
+
+/**
+ * Copy scale factors from SMEM → TMEM via tcgen05.cp.
+ *
+ * Instruction: tcgen05.cp.cta_group::1.32x128b.warpx4 [tmem_col], smem_desc
+ *   - .32x128b: copies 32 rows × 128 bits (16 bytes) per warp-subpartition
+ *   - .warpx4:  replicates across all 4 warp subpartitions → fills 128 TMEM rows
+ *
+ * Used to load interleaved block scales into TMEM columns for block-scaled MMA.
+ * Must be issued by elected thread within a warp (warp-collective, .sync.aligned).
+ *
+ * @param tmem_col   Destination TMEM column address
+ * @param smem_desc  64-bit SMEM descriptor (SWIZZLE_NONE for scales)
+ */
+__device__ __forceinline__
+void tcgen05_cp_32x128b_warpx4(uint32_t tmem_col, uint64_t smem_desc) {
+    asm volatile(
+        "tcgen05.cp.cta_group::1.32x128b.warpx4 [%0], %1;\n"
+        : : "r"(tmem_col), "l"(smem_desc) : "memory"
+    );
+}
+
+/**
+ * Build an SMEM descriptor for scale factor tcgen05.cp (SWIZZLE_NONE).
+ * Same format as MMA descriptors but with layout_type=0.
+ *
+ * @param smem_addr     Shared memory address (from __cvta_generic_to_shared)
+ * @param stride_bytes  Row stride in bytes for the scale buffer
+ */
+__device__ __forceinline__
+uint64_t make_sf_smem_desc(uint32_t smem_addr, uint32_t stride_bytes) {
+    return make_smem_desc(smem_addr, stride_bytes, 0);  // layout_type=0 = SWIZZLE_NONE
+}
+
+/**
+ * Build the 32-bit instruction descriptor for block-scaled MMA
+ * (tcgen05.mma.kind::mxf4nvf4.block_scale.scale_vec::4X).
+ *
+ * Bit layout (from CUTLASS InstrDescriptorBlockScaled):
+ *   Bits [0,2)   : sparse_id2 (0 for dense)
+ *   Bit  [2]     : sparse_flag (0 for dense)
+ *   Bit  [3]     : reserved (0)
+ *   Bits [4,6)   : b_sf_id  (top 2 bits of SFB TMEM addr, >>30)
+ *   Bit  [6]     : reserved (0)
+ *   Bits [7,10)  : a_format (5=E2M1 for NVFP4)
+ *   Bits [10,13) : b_format (5=E2M1 for NVFP4)
+ *   Bit  [13]    : a_negate (0)
+ *   Bit  [14]    : b_negate (0)
+ *   Bit  [15]    : a_major (0=K-major)
+ *   Bit  [16]    : b_major (0=K-major)
+ *   Bits [17,23) : n_dim = N >> 3
+ *   Bit  [23]    : scale_format (0=E4M3, 1=E8M0)
+ *   Bits [24,29) : m_dim = M >> 4
+ *   Bits [29,31) : a_sf_id  (top 2 bits of SFA TMEM addr, >>30)
+ *   Bit  [31]    : k_size (0 for standard K)
+ *
+ * No c_format field — accumulator is implicitly FP32 for block-scaled MMA.
+ *
+ * sf_id constraints by scale_vec mode:
+ *   scale_vec::4X (block16, mxf4nvf4): only sf_id=00 valid
+ *   scale_vec::2X (block32, mxf4):     sf_id=00 or 10 valid
+ *   scale_vec::1X (block32, mxf8f6f4): sf_id=00,01,10,11 valid
+ *
+ * CUTLASS extracts sf_id from TMEM address: (tmem_sf_addr & 0xC0000000) >> 30
+ * Since TMEM addresses are < 512, sf_id is always 0 in practice.
+ *
+ * @param a_format     Input A format (5=E2M1 for NVFP4)
+ * @param b_format     Input B format (5=E2M1 for NVFP4)
+ * @param tile_m       Tile M dimension (must be multiple of 16)
+ * @param tile_n       Tile N dimension (must be multiple of 8)
+ * @param sfa_id       Scale factor ID for A (top 2 bits of SFA TMEM addr)
+ * @param sfb_id       Scale factor ID for B (top 2 bits of SFB TMEM addr)
+ * @param scale_format 0=E4M3 scales, 1=E8M0 scales (default 0)
+ */
+__device__ __host__ __forceinline__
+uint32_t make_idesc_blkscaled(
+    uint32_t a_format,
+    uint32_t b_format,
+    uint32_t tile_m,
+    uint32_t tile_n,
+    uint32_t sfa_id,
+    uint32_t sfb_id,
+    uint32_t scale_format = 0
+) {
+    uint32_t idesc = 0;
+    idesc |= (sfb_id & 0x3) << 4;              // bits [4,6): b_sf_id
+    idesc |= ((a_format & 0x7) << 7);          // bits [7,10): a_format
+    idesc |= ((b_format & 0x7) << 10);         // bits [10,13): b_format
+    idesc |= (((tile_n >> 3) & 0x3F) << 17);   // bits [17,23): n_dim
+    idesc |= ((scale_format & 0x1) << 23);     // bit  [23]: scale_format
+    idesc |= (((tile_m >> 4) & 0x1F) << 24);   // bits [24,29): m_dim
+    idesc |= (sfa_id & 0x3) << 29;             // bits [29,31): a_sf_id
+    return idesc;
+}
+
+/**
+ * Issue a block-scaled MMA:
+ *   tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.scale_vec::4X
+ *
+ * Full PTX syntax (7 operands):
+ *   tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.scale_vec::4X
+ *     [d-tmem], a-smem-desc, b-smem-desc, idesc, [sfa-tmem], [sfb-tmem], scale-D;
+ *
+ * Required modifiers for kind::mxf4nvf4:
+ *   .block_scale     — enables block-scaled operation
+ *   .scale_vec::4X   — 4 scale values per MMA atom (K_PER_MMA=64 / block16=16 = 4)
+ *                       Equivalent alias: .block16
+ *
+ * Valid scale_vec values by kind:
+ *   mxf4nvf4  → .scale_vec::4X  (.block16 alias)
+ *   mxf4      → .scale_vec::2X  (.block32 alias)
+ *   mxf8f6f4  → no scale_vec needed, just .block_scale
+ *
+ * Computes D = C + (A × SFA) × (B × SFB) where:
+ *   - A, B are NVFP4 (E2M1) operands in SMEM (via descriptors)
+ *   - SFA, SFB are E4M3 block scale factors in TMEM (loaded via tcgen05.cp)
+ *   - D is FP32 accumulator in TMEM
+ *
+ * @param d_tmem      Accumulator TMEM address
+ * @param desc_a      64-bit SMEM descriptor for A operand
+ * @param desc_b      64-bit SMEM descriptor for B operand
+ * @param idesc       Block-scaled instruction descriptor (from make_idesc_blkscaled)
+ * @param sfa_tmem    SFA TMEM column address
+ * @param sfb_tmem    SFB TMEM column address
+ * @param accumulate  false for first MMA (D=A×B), true for subsequent (D+=A×B)
+ */
+__device__ __forceinline__
+void blkscaled_mma_mxf4nvf4(
+    tmem_addr_t d_tmem,
+    uint64_t desc_a,
+    uint64_t desc_b,
+    uint32_t idesc,
+    tmem_addr_t sfa_tmem,
+    tmem_addr_t sfb_tmem,
+    bool accumulate
+) {
+    // Match CUTLASS SM100_MMA_MXF4_SS exactly:
+    // - enable_input_d is passed as a predicate register p (not a literal)
+    // - scaleC is a uint32_t: 0 = clear accumulator, non-zero = accumulate
+    uint32_t scaleC = accumulate ? 1u : 0u;
+    asm volatile(
+        "{\n\t"
+        ".reg .pred p;\n\t"
+        "setp.ne.b32 p, %4, 0;\n\t"
+        "tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.block16 "
+        "[%0], %1, %2, %3, [%5], [%6], p;\n\t"
+        "}\n"
+        :
+        : "r"(d_tmem), "l"(desc_a), "l"(desc_b), "r"(idesc), "r"(scaleC),
+          "r"(sfa_tmem), "r"(sfb_tmem)
+    );
+}
+
 }  // namespace blaze

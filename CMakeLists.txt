@@ -33,6 +33,7 @@ target_link_libraries(gemm_fp16_naive CUDA::cublas)
 add_library(blaze_gemm STATIC
     src/kernels/gemm_fp8_sm100.cu
     src/kernels/gemm_fp4_sm100.cu
+    src/kernels/gemm_fp4_blkscaled_sm100.cu
     src/kernels/gemm_mixed_sm100.cu
 )
 target_link_libraries(blaze_gemm CUDA::cuda_driver)
