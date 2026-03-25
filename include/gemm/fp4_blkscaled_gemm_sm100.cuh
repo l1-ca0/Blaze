@@ -8,15 +8,15 @@
  * Key differences from fp4_gemm_sm100.cuh (software scale path):
  *   - Block scales loaded via TMA → SMEM → tcgen05.cp → TMEM (not global loads)
  *   - MMA instruction natively applies block scales (7-operand form)
- *   - Only 2 active warps during K-loop (producer + consumer), warps 2-3 idle
- *   - mbar_load init=1 (TMA producer only, no scale loader warps)
+ *   - 3 active warps during K-loop (consumer + 2 producers), warp 3 idle
+ *   - mbar_load init=2 (2 TMA producer warps)
  *   - TMEM alloc 256 columns (128 accum + 8 SFA + 8 SFB)
  *   - Interleaved scale format required for TMEM-compatible layout (SfAtom)
  *
  * Warp-specialized, 2-stage double-buffered pipeline:
- *   Warp 0: MMA consumer  (tcgen05.cp for scales + block-scaled MMA)
- *   Warp 1: TMA producer  (4 TMA loads: A_data + B_data + SFA + SFB)
- *   Warp 2: Idle during K-loop
+ *   Warp 0: MMA consumer   (tcgen05.cp for scales + block-scaled MMA)
+ *   Warp 1: TMA producer A (A_data + SFA loads, 9216 bytes/stage)
+ *   Warp 2: TMA producer B (B_data + SFB loads, 9216 bytes/stage)
  *   Warp 3: Idle during K-loop
  *   All warps: Epilogue   (TMEM → registers → global store)
  *

@@ -104,46 +104,72 @@ __global__ void interleave_scales_transposed_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// TMA producer (warp 1)
+// TMA producers (warps 1 and 2, balanced split by operand)
 // ---------------------------------------------------------------------------
 
+// Producer A (warp 1): loads A_data + SFA — one operand's data and scales.
 __device__ __forceinline__
-void fp4_blkscaled_tma_producer(
+void fp4_blkscaled_tma_producer_a(
     Fp4BlkScaledSmemLayout* smem,
     const TmaDescriptor* desc_A_data,
-    const TmaDescriptor* desc_B_data,
     const TmaDescriptor* desc_SFA,
-    const TmaDescriptor* desc_SFB,
-    int bm, int bn, int K, int lane_id
+    int bm, int K, int lane_id
 ) {
+    static constexpr uint32_t TX_BYTES = Config::SMEM_A_DATA_BYTES
+                                       + Config::SMEM_SFA_BYTES;  // 9216
     const int num_k_tiles = K / Config::TILE_K;
 
     for (int k_tile = 0; k_tile < num_k_tiles; k_tile++) {
         int stage = k_tile % Config::PIPELINE_STAGES;
         int k_offset = k_tile * Config::TILE_K;
 
+        // Wait for consumer to finish with this stage before reusing it
         if (k_tile >= Config::PIPELINE_STAGES) {
             mbarrier_wait(&smem->mbar_mma[stage],
                          ((k_tile / Config::PIPELINE_STAGES) + 1) & 1);
         }
 
         if (lane_id == 0) {
-            uint32_t tx_bytes = Config::SMEM_A_DATA_BYTES
-                              + Config::SMEM_B_DATA_BYTES
-                              + Config::SMEM_SFA_BYTES
-                              + Config::SMEM_SFB_BYTES;
-            mbarrier_expect_tx(&smem->mbar_load[stage], tx_bytes);
+            mbarrier_expect_tx(&smem->mbar_load[stage], TX_BYTES);
 
             // A_data: [M, K/2] global, tile [TILE_M, TILE_K/2]
             tma_load_2d(smem->A_data[stage], desc_A_data,
                         k_offset / 2, bm, &smem->mbar_load[stage]);
-            // B_data: [K, N/2] global, tile [TILE_K, TILE_N/2]
-            tma_load_2d(smem->B_data[stage], desc_B_data,
-                        bn / 2, k_offset, &smem->mbar_load[stage]);
-
             // SFA: [M/4, K/4] global, tile [32, TILE_K/4=32]
             tma_load_2d(smem->SFA[stage], desc_SFA,
                         k_offset / 4, bm / 4, &smem->mbar_load[stage]);
+        }
+    }
+}
+
+// Producer B (warp 2): loads B_data + SFB — the other operand's data and scales.
+__device__ __forceinline__
+void fp4_blkscaled_tma_producer_b(
+    Fp4BlkScaledSmemLayout* smem,
+    const TmaDescriptor* desc_B_data,
+    const TmaDescriptor* desc_SFB,
+    int bn, int K, int lane_id
+) {
+    static constexpr uint32_t TX_BYTES = Config::SMEM_B_DATA_BYTES
+                                       + Config::SMEM_SFB_BYTES;  // 9216
+    const int num_k_tiles = K / Config::TILE_K;
+
+    for (int k_tile = 0; k_tile < num_k_tiles; k_tile++) {
+        int stage = k_tile % Config::PIPELINE_STAGES;
+        int k_offset = k_tile * Config::TILE_K;
+
+        // Wait for consumer to finish with this stage before reusing it
+        if (k_tile >= Config::PIPELINE_STAGES) {
+            mbarrier_wait(&smem->mbar_mma[stage],
+                         ((k_tile / Config::PIPELINE_STAGES) + 1) & 1);
+        }
+
+        if (lane_id == 0) {
+            mbarrier_expect_tx(&smem->mbar_load[stage], TX_BYTES);
+
+            // B_data: [K, N/2] global, tile [TILE_K, TILE_N/2]
+            tma_load_2d(smem->B_data[stage], desc_B_data,
+                        bn / 2, k_offset, &smem->mbar_load[stage]);
             // SFB: [N/4, K/4] global, tile [32, TILE_K/4=32]
             tma_load_2d(smem->SFB[stage], desc_SFB,
                         k_offset / 4, bn / 4, &smem->mbar_load[stage]);
@@ -322,7 +348,7 @@ gemm_fp4_blkscaled_kernel(
 
     if (tid == 0) {
         for (int s = 0; s < Config::PIPELINE_STAGES; s++) {
-            mbarrier_init(&smem->mbar_load[s], 1);
+            mbarrier_init(&smem->mbar_load[s], 2);  // 2 producer warps
             mbarrier_init(&smem->mbar_mma[s], 1);
         }
     }
@@ -343,10 +369,14 @@ gemm_fp4_blkscaled_kernel(
             fp4_blkscaled_mma_consumer(smem, tmem_base, tmem_sfa, tmem_sfb, K);
             break;
         case 1:
-            fp4_blkscaled_tma_producer(smem, desc_A_data, desc_B_data,
-                                        desc_SFA, desc_SFB, bm, bn, K, lane_id);
+            fp4_blkscaled_tma_producer_a(smem, desc_A_data, desc_SFA,
+                                          bm, K, lane_id);
             break;
-        default: break;
+        case 2:
+            fp4_blkscaled_tma_producer_b(smem, desc_B_data, desc_SFB,
+                                          bn, K, lane_id);
+            break;
+        default: break;  // warp 3 idle during K-loop
     }
 
     __syncthreads();
