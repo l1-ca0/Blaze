@@ -401,20 +401,20 @@ int main() {
             1.0f, K_aligned, sh.N
         };
 
-        // Warmup
+        auto* plan_p = blaze::create_fp4_blkscaled_persistent_gemm_plan(
+            A_fp4_bs_p, B_fp4_bs_p, sh.M, sh.N, K_aligned);
+
+        // Time kernel only
         for (int i = 0; i < warmup; i++)
-            blaze::launch_gemm_fp4_blkscaled_persistent(
-                A_fp4_bs_p, B_fp4_bs_p, d_C, sh.M, sh.N, K_aligned);
+            blaze::execute_fp4_blkscaled_persistent_gemm(plan_p, d_C);
         CHECK_CUDA(cudaDeviceSynchronize());
 
-        // Timed iterations
         cudaEvent_t start, stop;
         CHECK_CUDA(cudaEventCreate(&start));
         CHECK_CUDA(cudaEventCreate(&stop));
         CHECK_CUDA(cudaEventRecord(start));
         for (int i = 0; i < iters; i++)
-            blaze::launch_gemm_fp4_blkscaled_persistent(
-                A_fp4_bs_p, B_fp4_bs_p, d_C, sh.M, sh.N, K_aligned);
+            blaze::execute_fp4_blkscaled_persistent_gemm(plan_p, d_C);
         CHECK_CUDA(cudaEventRecord(stop));
         CHECK_CUDA(cudaEventSynchronize(stop));
 
@@ -437,6 +437,7 @@ int main() {
 
         CHECK_CUDA(cudaEventDestroy(start));
         CHECK_CUDA(cudaEventDestroy(stop));
+        blaze::destroy_fp4_blkscaled_persistent_gemm_plan(plan_p);
     }
 
     CHECK_CUDA(cudaFree(d_A_fp4_data));

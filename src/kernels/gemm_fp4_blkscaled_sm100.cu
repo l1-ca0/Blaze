@@ -1076,4 +1076,157 @@ void launch_gemm_fp4_blkscaled_persistent(
     if (A_data_padded) cudaFreeAsync(A_data_padded, stream);
 }
 
+// ---------------------------------------------------------------------------
+// Persistent prepare/execute API
+// ---------------------------------------------------------------------------
+
+struct Fp4BlkScaledPersistentGemmPlan {
+    uint8_t* A_data_padded;
+    uint8_t* sfa_interleaved;
+    uint8_t* sfb_interleaved;
+    TmaDescriptor* d_descs;
+    int* d_tile_counter;
+    float tensor_scale_A;
+    float tensor_scale_B;
+    const half* bias;
+    Fp4BlkScaledEpilogue epilogue;
+    dim3 grid;
+    dim3 block;
+    size_t smem_size;
+    int M, N, K;
+    int total_tiles;
+    int grid_n;
+};
+
+Fp4BlkScaledPersistentGemmPlan* create_fp4_blkscaled_persistent_gemm_plan(
+    const Fp4BlkScaledWeightTensor& A,
+    const Fp4BlkScaledWeightTensor& B,
+    int M, int N, int K,
+    const half* bias,
+    Fp4BlkScaledEpilogue epilogue
+) {
+    auto* plan = new Fp4BlkScaledPersistentGemmPlan();
+    plan->M = M;
+    plan->N = N;
+    plan->K = K;
+    plan->tensor_scale_A = A.tensor_scale;
+    plan->tensor_scale_B = B.tensor_scale;
+    plan->bias = bias;
+    plan->epilogue = epilogue;
+    plan->A_data_padded = nullptr;
+
+    int sf_k = K / Config::SF_VEC_SIZE;
+    int sf_cols = sf_k * 4;
+    int M_pad = (M < Config::TILE_M) ? Config::TILE_M : M;
+    int sfa_rows_pad = M_pad / 4;
+    int sfb_rows = N / 4;
+
+    // Interleave SFA
+    cudaMalloc(&plan->sfa_interleaved, (size_t)sfa_rows_pad * sf_cols);
+    cudaMemset(plan->sfa_interleaved, 0, (size_t)sfa_rows_pad * sf_cols);
+    {
+        int blocks = (M + 127) / 128;
+        interleave_scales_kernel<<<blocks, 128>>>(
+            A.block_scales, plan->sfa_interleaved, M, sf_k);
+    }
+
+    // Interleave SFB (transposed: src is [sf_k, N])
+    cudaMalloc(&plan->sfb_interleaved, (size_t)sfb_rows * sf_cols);
+    cudaMemset(plan->sfb_interleaved, 0, (size_t)sfb_rows * sf_cols);
+    {
+        int blocks = (N + 127) / 128;
+        interleave_scales_transposed_kernel<<<blocks, 128>>>(
+            B.block_scales, plan->sfb_interleaved, N, sf_k, N);
+    }
+
+    // Pad A if needed
+    const uint8_t* A_data_tma = A.data;
+    if (M < Config::TILE_M) {
+        size_t data_bytes = (size_t)M_pad * K / 2;
+        cudaMalloc(&plan->A_data_padded, data_bytes);
+        cudaMemset(plan->A_data_padded, 0, data_bytes);
+        cudaMemcpy(plan->A_data_padded, A.data, (size_t)M * K / 2,
+                   cudaMemcpyDeviceToDevice);
+        A_data_tma = plan->A_data_padded;
+    }
+
+    // TMA descriptors
+    TmaDescriptor h_desc_A, h_desc_B, h_desc_SFA, h_desc_SFB;
+
+    create_tma_desc_2d(&h_desc_A, A_data_tma, CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                       M_pad, K / 2, Config::TILE_M, Config::TILE_K / 2, TmaSwizzle::B64);
+    create_tma_desc_2d(&h_desc_B, B.data, CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                       K, N / 2, Config::TILE_K, Config::TILE_N / 2, TmaSwizzle::B64);
+    create_tma_desc_2d(&h_desc_SFA, plan->sfa_interleaved, CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                       sfa_rows_pad, sf_cols, 32, Config::TILE_K / 4, TmaSwizzle::NONE);
+    create_tma_desc_2d(&h_desc_SFB, plan->sfb_interleaved, CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                       sfb_rows, sf_cols, 32, Config::TILE_K / 4, TmaSwizzle::NONE);
+
+    cudaMalloc(&plan->d_descs, 4 * sizeof(TmaDescriptor));
+    cudaMemcpy(plan->d_descs,     &h_desc_A,   sizeof(TmaDescriptor), cudaMemcpyHostToDevice);
+    cudaMemcpy(plan->d_descs + 1, &h_desc_B,   sizeof(TmaDescriptor), cudaMemcpyHostToDevice);
+    cudaMemcpy(plan->d_descs + 2, &h_desc_SFA, sizeof(TmaDescriptor), cudaMemcpyHostToDevice);
+    cudaMemcpy(plan->d_descs + 3, &h_desc_SFB, sizeof(TmaDescriptor), cudaMemcpyHostToDevice);
+
+    // Atomic tile counter (persistent across execute calls, reset each time)
+    cudaMalloc(&plan->d_tile_counter, sizeof(int));
+
+    // Grid dimensions
+    int grid_m = (M_pad + Config::TILE_M - 1) / Config::TILE_M;
+    plan->grid_n = (N + Config::TILE_N - 1) / Config::TILE_N;
+    plan->total_tiles = grid_m * plan->grid_n;
+
+    int device_id = 0;
+    cudaGetDevice(&device_id);
+    int num_sms = 0;
+    cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device_id);
+    int num_ctas = (plan->total_tiles < num_sms) ? plan->total_tiles : num_sms;
+
+    plan->grid = dim3(num_ctas);
+    plan->block = dim3(Config::BLOCK_SIZE);
+    plan->smem_size = sizeof(Fp4BlkScaledSmemPersistent);
+
+    cudaFuncSetAttribute(gemm_fp4_blkscaled_persistent_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, plan->smem_size);
+
+    cudaDeviceSynchronize();
+    return plan;
+}
+
+void execute_fp4_blkscaled_persistent_gemm(Fp4BlkScaledPersistentGemmPlan* plan, half* C, cudaStream_t stream) {
+    // Reset tile counter for this execution
+    cudaMemsetAsync(plan->d_tile_counter, 0, sizeof(int), stream);
+
+    cudaLaunchConfig_t launch_config = {};
+    launch_config.gridDim = plan->grid;
+    launch_config.blockDim = plan->block;
+    launch_config.dynamicSmemBytes = plan->smem_size;
+    launch_config.stream = stream;
+
+    cudaLaunchAttribute launch_attrs[1];
+    launch_attrs[0].id = cudaLaunchAttributeClusterDimension;
+    launch_attrs[0].val.clusterDim.x = 1;
+    launch_attrs[0].val.clusterDim.y = 1;
+    launch_attrs[0].val.clusterDim.z = 1;
+    launch_config.attrs = launch_attrs;
+    launch_config.numAttrs = 1;
+
+    cudaLaunchKernelEx(&launch_config, gemm_fp4_blkscaled_persistent_kernel,
+        plan->d_descs, plan->d_descs + 1, plan->d_descs + 2, plan->d_descs + 3,
+        C, plan->M, plan->N, plan->K,
+        plan->tensor_scale_A, plan->tensor_scale_B,
+        plan->bias, plan->epilogue,
+        plan->d_tile_counter, plan->total_tiles, plan->grid_n);
+}
+
+void destroy_fp4_blkscaled_persistent_gemm_plan(Fp4BlkScaledPersistentGemmPlan* plan) {
+    if (!plan) return;
+    if (plan->A_data_padded) cudaFree(plan->A_data_padded);
+    if (plan->sfa_interleaved) cudaFree(plan->sfa_interleaved);
+    if (plan->sfb_interleaved) cudaFree(plan->sfb_interleaved);
+    if (plan->d_descs) cudaFree(plan->d_descs);
+    if (plan->d_tile_counter) cudaFree(plan->d_tile_counter);
+    delete plan;
+}
+
 }  // namespace blaze

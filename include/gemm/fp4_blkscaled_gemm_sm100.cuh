@@ -12,14 +12,11 @@
  *    - mbar_load init=2 (2 TMA producer warps)
  *    - TMEM alloc 256 columns (128 accum + 8 SFA + 8 SFB)
  *
- * 2. Persistent (P1): all tiles processed by persistent CTAs.
+ * 2. Persistent: all tiles processed by persistent CTAs.
  *    - Same warp roles as non-persistent (warp 3 idle during K-loop)
  *    - TMEM alloc 256 columns (same as non-persistent)
  *    - Atomic counter dynamically assigns tiles, eliminating launch overhead
  *    - All 4 warps cooperate on epilogue between tiles
- *    - Future: CLC (clusterlaunchcontrol.try_cancel) once CUDA toolchain supports it
- *    - Future P2: overlap epilogue via tcgen05.st → SMEM staging
- *      (TMEM is warp-scoped, so single-warp epilogue can't read all 128 rows)
  *
  * Common:
  *   - Block scales loaded via TMA → SMEM → tcgen05.cp → TMEM
@@ -98,27 +95,10 @@ struct Fp4BlkScaledConfig {
     static constexpr int TMEM_TOTAL_NEEDED = TMEM_ACCUM_COLS + TMEM_SFA_COLS + TMEM_SFB_COLS;  // 144
     static constexpr int TMEM_ALLOC_COLS = 256;                       // next power-of-2 >= 144
 
-    // TMEM column offsets (non-persistent)
+    // TMEM column offsets
     static constexpr int TMEM_ACCUM_START = 0;
     static constexpr int TMEM_SFA_START = TMEM_ACCUM_COLS;            // 128
     static constexpr int TMEM_SFB_START = TMEM_SFA_START + TMEM_SFA_COLS;  // 136
-
-    // --- Future P2 TMEM layout (double-buffered accum + SMEM staging) ---
-    // Currently unused: P1 persistent kernel uses same TMEM layout as non-persistent.
-    // Double-buffered accumulators for ping-pong:
-    //   [0,   128)  Accumulator buffer 0
-    //   [128, 256)  Accumulator buffer 1
-    //   [256, 264)  SFA (shared, 8 cols)
-    //   [264, 272)  SFB (shared, 8 cols)
-    // Total needed: 272 → alloc 512 (next power-of-2)
-    static constexpr int TMEM_ACCUM_COLS_PERSISTENT = 2 * TILE_N;    // 256
-    static constexpr int TMEM_ALLOC_COLS_PERSISTENT = 512;
-    static constexpr int TMEM_ACCUM_BUF_STRIDE = TILE_N;             // 128 cols between buffers
-    static constexpr int TMEM_SFA_START_PERSISTENT = TMEM_ACCUM_COLS_PERSISTENT;  // 256
-    static constexpr int TMEM_SFB_START_PERSISTENT = TMEM_SFA_START_PERSISTENT + TMEM_SFA_COLS;  // 264
-
-    // Accumulator pipeline: 2 buffers for ping-pong
-    static constexpr int NUM_ACCUM_BUFS = 2;
 };
 
 /**
@@ -185,18 +165,17 @@ void execute_fp4_blkscaled_gemm(Fp4BlkScaledGemmPlan* plan, half* C, cudaStream_
 void destroy_fp4_blkscaled_gemm_plan(Fp4BlkScaledGemmPlan* plan);
 
 // ---------------------------------------------------------------------------
-// Persistent kernel API (P1+P2)
+// Persistent kernel API
 // ---------------------------------------------------------------------------
 
 /**
  * Launch persistent block-scaled FP4 GEMM: C = A × B
  *
- * Uses CLC (Cluster Launch Control) for dynamic tile scheduling.
- * TMEM persists across tiles. Accumulator double-buffering overlaps
- * epilogue of tile N with mainloop of tile N+1.
+ * Persistent CTAs loop over tiles via atomic counter scheduling.
+ * TMEM persists across tiles. All 4 warps cooperate on epilogue.
  *
  * Same correctness as launch_gemm_fp4_blkscaled, but higher throughput
- * due to eliminated inter-tile dead time.
+ * due to eliminated inter-tile launch overhead.
  */
 void launch_gemm_fp4_blkscaled_persistent(
     const Fp4BlkScaledWeightTensor& A,
@@ -207,5 +186,25 @@ void launch_gemm_fp4_blkscaled_persistent(
     Fp4BlkScaledEpilogue epilogue = Fp4BlkScaledEpilogue::NONE,
     cudaStream_t stream = 0
 );
+
+// ---------------------------------------------------------------------------
+// Persistent prepare/execute API — same idea as non-persistent plan:
+// pre-allocates workspace, interleaved scales, TMA descriptors, and atomic
+// counter once. execute() only resets the counter and launches the kernel.
+// ---------------------------------------------------------------------------
+
+struct Fp4BlkScaledPersistentGemmPlan;
+
+Fp4BlkScaledPersistentGemmPlan* create_fp4_blkscaled_persistent_gemm_plan(
+    const Fp4BlkScaledWeightTensor& A,
+    const Fp4BlkScaledWeightTensor& B,
+    int M, int N, int K,
+    const half* bias = nullptr,
+    Fp4BlkScaledEpilogue epilogue = Fp4BlkScaledEpilogue::NONE
+);
+
+void execute_fp4_blkscaled_persistent_gemm(Fp4BlkScaledPersistentGemmPlan* plan, half* C, cudaStream_t stream = 0);
+
+void destroy_fp4_blkscaled_persistent_gemm_plan(Fp4BlkScaledPersistentGemmPlan* plan);
 
 }  // namespace blaze

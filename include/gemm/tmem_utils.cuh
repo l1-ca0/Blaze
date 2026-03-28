@@ -235,8 +235,7 @@ tmem_addr_t tmem_broadcast_addr(tmem_addr_t addr) {
  * Must be issued by elected thread (warp-collective via elect_one_sync()).
  *
  * NOTE: Previously triggered ptxas ICE (C7907) in CUDA 13.1.80 with
- * kind::f8f6f4 MMA. Re-testing with kind::mxf4nvf4.block_scale.block16
- * in Step P1+P2.0.
+ * kind::f8f6f4 MMA.
  *
  * @param mbar_smem  Pointer to shared memory mbarrier
  */
