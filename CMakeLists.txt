@@ -48,6 +48,10 @@ target_link_libraries(test_gemm blaze_gemm CUDA::cublas)
 add_executable(test_sm100_primitives tests/test_sm100_primitives.cu)
 target_link_libraries(test_sm100_primitives CUDA::cuda_driver)
 
+# test_commit disabled: tcgen05.commit has "State space incorrect" error in CUDA 13.1.80
+# add_executable(test_commit tests/test_commit.cu)
+# target_link_libraries(test_commit CUDA::cuda_driver)
+
 # --- Benchmarks ---
 add_executable(bench_gemm benchmarks/bench_gemm.cu)
 target_link_libraries(bench_gemm blaze_gemm CUDA::cublas)

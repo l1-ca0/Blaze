@@ -223,10 +223,91 @@ tmem_addr_t tmem_broadcast_addr(tmem_addr_t addr) {
     return __shfl_sync(0xFFFFFFFF, addr, 0);
 }
 
-// NOTE: tcgen05.commit is the proper way to wait for async MMA TMEM writes,
-// but triggers ptxas ICE (C7907) in CUDA 13.1.80. Workaround: the MMA consumer
-// warp does TMEM→SMEM itself after fence::before_thread_sync (which ensures
-// MMA completion for the issuing warp), avoiding the need for tcgen05.commit.
+/**
+ * Signal MMA completion to an mbarrier.
+ *
+ * Groups all prior tcgen05.mma operations issued by this CTA. When ALL grouped
+ * MMAs complete, atomically arrives at the specified mbarrier (decrements
+ * pending arrival count by 1). The instruction is ASYNCHRONOUS — the issuing
+ * warp continues immediately; the mbarrier arrival happens later when MMA HW
+ * finishes.
+ *
+ * Must be issued by elected thread (warp-collective via elect_one_sync()).
+ *
+ * NOTE: Previously triggered ptxas ICE (C7907) in CUDA 13.1.80 with
+ * kind::f8f6f4 MMA. Re-testing with kind::mxf4nvf4.block_scale.block16
+ * in Step P1+P2.0.
+ *
+ * @param mbar_smem  Pointer to shared memory mbarrier
+ */
+__device__ __forceinline__
+void tcgen05_commit(uint64_t* mbar_smem) {
+    uint32_t mbar_addr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar_smem));
+    asm volatile(
+        "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cta.b64 [%0];\n"
+        : : "r"(mbar_addr) : "memory"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CLC (Cluster Launch Control) helpers for persistent kernels
+// ---------------------------------------------------------------------------
+
+/**
+ * Query CLC hardware for the next tile assignment.
+ *
+ * Asynchronously writes a 16-byte response to SMEM. Completion is signaled
+ * via mbarrier (complete_tx::bytes, 16 bytes). The caller must:
+ *   1. mbarrier_expect_tx(mbar, 16) before calling this
+ *   2. mbarrier_wait(mbar, phase) after calling this
+ *   3. Parse the 16-byte response for valid bit and linear tile ID
+ *
+ * If CLC returns decline (valid=0), all tiles have been assigned and the
+ * kernel should exit its persistent loop.
+ *
+ * Must be called by a single elected thread.
+ *
+ * @param smem_response  Pointer to 16-byte aligned SMEM buffer for response
+ * @param mbar_smem      Pointer to shared memory mbarrier
+ * @param cta_mask       Bitmask of CTAs in cluster participating (0x1 for 1×1×1)
+ */
+__device__ __forceinline__
+void clc_try_cancel(void* smem_response, uint64_t* mbar_smem, uint32_t cta_mask) {
+    uint32_t resp_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_response));
+    uint32_t mbar_addr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar_smem));
+    asm volatile(
+        "clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.b128 "
+        "[%0], [%1], %2;\n"
+        : : "r"(resp_addr), "r"(mbar_addr), "r"(cta_mask) : "memory"
+    );
+}
+
+/**
+ * CLC response: 128-bit (16 bytes) written to SMEM by clc_try_cancel.
+ *
+ * Bit layout (from CUTLASS sm100_tile_scheduler.hpp):
+ *   Word 0, bit 0:      valid (1=tile assigned, 0=decline/done)
+ *   Word 0, bits [1,32): linear tile ID (right-shifted by 1)
+ *
+ * Linear ID → 2D coords: tile_m = linear_id / grid_n, tile_n = linear_id % grid_n
+ */
+struct ClcResponse {
+    uint32_t data[4];
+};
+
+__device__ __forceinline__
+bool clc_is_valid(const ClcResponse* resp) {
+    return (resp->data[0] & 1u) != 0;
+}
+
+__device__ __forceinline__
+uint32_t clc_get_linear_id(const ClcResponse* resp) {
+    return (resp->data[0] >> 1);
+}
+
+// ---------------------------------------------------------------------------
+// TMEM utilities (continued)
+// ---------------------------------------------------------------------------
 
 /**
  * RAII-style TMEM guard. Ensures deallocation on scope exit.
