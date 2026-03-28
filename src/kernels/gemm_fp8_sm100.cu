@@ -221,6 +221,10 @@ gemm_fp8_kernel(
 
     if (tid == 0) {
         for (int s = 0; s < Config::PIPELINE_STAGES; s++) {
+            mbarrier_inval(&smem->mbar_load[s]);
+            mbarrier_inval(&smem->mbar_mma[s]);
+        }
+        for (int s = 0; s < Config::PIPELINE_STAGES; s++) {
             mbarrier_init(&smem->mbar_load[s], 1);
             mbarrier_init(&smem->mbar_mma[s], 1);
         }

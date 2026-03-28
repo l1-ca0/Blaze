@@ -230,6 +230,24 @@ void mbarrier_wait(uint64_t* mbar_ptr, uint32_t phase) {
 }
 
 /**
+ * Invalidate an mbarrier, clearing all internal state including TX tracking.
+ *
+ * Must be called before mbarrier_init when reusing a barrier that previously
+ * had expect_tx arrivals (e.g., in persistent kernel tile loops).
+ * After invalidation, the barrier must be reinitialized before use.
+ */
+__device__ __forceinline__
+void mbarrier_inval(uint64_t* mbar_ptr) {
+    uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar_ptr));
+    asm volatile(
+        "mbarrier.inval.shared.b64 [%0];\n"
+        :
+        : "r"(smem_addr)
+        : "memory"
+    );
+}
+
+/**
  * Arrive at an mbarrier (non-TMA thread arrival).
  */
 __device__ __forceinline__
