@@ -91,12 +91,14 @@ void mma_consumer(SmemLayout* smem, tmem_addr_t tmem_addr, int K) {
         int stage = k_tile % Config::PIPELINE_STAGES;
         mbarrier_wait(&smem->mbar_load[stage], (k_tile / Config::PIPELINE_STAGES) & 1);
 
+        // Ensure TMA async writes to SMEM are visible before tcgen05 reads them.
+        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+        asm volatile("tcgen05.fence::after_thread_sync;\n" ::: "memory");
+
         uint32_t smem_a_base = static_cast<uint32_t>(__cvta_generic_to_shared(smem->A[stage]));
         uint32_t smem_b_base = static_cast<uint32_t>(__cvta_generic_to_shared(smem->B[stage]));
 
         for (int ki = 0; ki < NUM_K_ITERS; ki++) {
-            asm volatile("tcgen05.fence::after_thread_sync;\n" ::: "memory");
-
             uint32_t smem_a_addr = smem_a_base + ki * K_PER_MMA;
             uint32_t smem_b_addr = smem_b_base + ki * K_PER_MMA * Config::TILE_N;
 
@@ -115,10 +117,9 @@ void mma_consumer(SmemLayout* smem, tmem_addr_t tmem_addr, int K) {
                 }
             }
             first_mma = false;
-
-            asm volatile("tcgen05.fence::before_thread_sync;\n" ::: "memory");
         }
 
+        asm volatile("tcgen05.fence::before_thread_sync;\n" ::: "memory");
         __syncwarp();
         if (elect_one_sync()) {
             mbarrier_arrive(&smem->mbar_mma[stage]);
