@@ -38,6 +38,12 @@ add_library(blaze_gemm STATIC
 )
 target_link_libraries(blaze_gemm CUDA::cuda_driver)
 
+# --- cuBLAS GEMM backends (for Phase 2 inference while custom kernels are optimized) ---
+add_library(blaze_cublas_gemm STATIC
+    src/kernels/cublas_gemm.cu
+)
+target_link_libraries(blaze_cublas_gemm blaze_gemm CUDA::cublas CUDA::cublasLt)
+
 # --- Tests ---
 add_executable(test_gemm_naive tests/test_gemm_naive.cu)
 target_link_libraries(test_gemm_naive CUDA::cublas)
@@ -51,6 +57,9 @@ target_link_libraries(test_sm100_primitives CUDA::cuda_driver)
 # test_commit disabled: tcgen05.commit has "State space incorrect" error in CUDA 13.1.80
 # add_executable(test_commit tests/test_commit.cu)
 # target_link_libraries(test_commit CUDA::cuda_driver)
+
+add_executable(test_cublas_gemm tests/test_cublas_gemm.cu)
+target_link_libraries(test_cublas_gemm blaze_cublas_gemm)
 
 # --- Benchmarks ---
 add_executable(bench_gemm benchmarks/bench_gemm.cu)
