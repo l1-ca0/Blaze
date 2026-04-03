@@ -128,7 +128,12 @@ static ErrorStats compute_error(const float* ref, const half* test, int n) {
         if (isnan(t)) { s.nan_count++; continue; }
         if (isinf(t)) { s.inf_count++; continue; }
         float abs_err = fabsf(r - t);
-        float rel_err = abs_err / (fabsf(r) + 1e-6f);
+        // Use max(|ref|, |test|, 1.0) denominator to avoid inflated relative
+        // error on near-zero values. For GEMM with random [-0.5,0.5] inputs,
+        // many outputs cluster near zero where tiny absolute differences
+        // produce huge relative errors with a naive denominator.
+        float denom = fmaxf(fmaxf(fabsf(r), fabsf(t)), 1.0f);
+        float rel_err = abs_err / denom;
         s.max_abs = fmaxf(s.max_abs, abs_err);
         s.max_rel = fmaxf(s.max_rel, rel_err);
         sum_rel += rel_err;

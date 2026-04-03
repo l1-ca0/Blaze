@@ -16,6 +16,10 @@
 #include <cstdlib>
 #include <mutex>
 
+#ifndef CUBLASLT_MATMUL_PREFERENCE_MAX_WORKSPACE_BYTES
+#define CUBLASLT_MATMUL_PREFERENCE_MAX_WORKSPACE_BYTES CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES
+#endif
+
 namespace blaze {
 
 // ============================================================================
