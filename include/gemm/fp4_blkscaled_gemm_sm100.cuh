@@ -5,18 +5,10 @@
  * Uses tcgen05.mma.kind::mxf4nvf4.block_scale.block16 for
  * hardware-native block scale application.
  *
- * Two kernel variants:
- *
- * 1. Non-persistent (original): one CTA per output tile.
+ * Kernel architecture:
  *    - 3 active warps during K-loop (consumer + 2 producers), warp 3 idle
  *    - mbar_load init=2 (2 TMA producer warps)
  *    - TMEM alloc 256 columns (128 accum + 8 SFA + 8 SFB)
- *
- * 2. Persistent: all tiles processed by persistent CTAs.
- *    - Same warp roles as non-persistent (warp 3 idle during K-loop)
- *    - TMEM alloc 256 columns (same as non-persistent)
- *    - Atomic counter dynamically assigns tiles, eliminating launch overhead
- *    - All 4 warps cooperate on epilogue between tiles
  *
  * Common:
  *   - Block scales loaded via TMA → SMEM → tcgen05.cp → TMEM
@@ -163,48 +155,5 @@ Fp4BlkScaledGemmPlan* create_fp4_blkscaled_gemm_plan(
 void execute_fp4_blkscaled_gemm(Fp4BlkScaledGemmPlan* plan, half* C, cudaStream_t stream = 0);
 
 void destroy_fp4_blkscaled_gemm_plan(Fp4BlkScaledGemmPlan* plan);
-
-// ---------------------------------------------------------------------------
-// Persistent kernel API
-// ---------------------------------------------------------------------------
-
-/**
- * Launch persistent block-scaled FP4 GEMM: C = A × B
- *
- * Persistent CTAs loop over tiles via atomic counter scheduling.
- * TMEM persists across tiles. All 4 warps cooperate on epilogue.
- *
- * Same correctness as launch_gemm_fp4_blkscaled, but higher throughput
- * due to eliminated inter-tile launch overhead.
- */
-void launch_gemm_fp4_blkscaled_persistent(
-    const Fp4BlkScaledWeightTensor& A,
-    const Fp4BlkScaledWeightTensor& B,
-    half* C,
-    int M, int N, int K,
-    const half* bias = nullptr,
-    Fp4BlkScaledEpilogue epilogue = Fp4BlkScaledEpilogue::NONE,
-    cudaStream_t stream = 0
-);
-
-// ---------------------------------------------------------------------------
-// Persistent prepare/execute API — same idea as non-persistent plan:
-// pre-allocates workspace, interleaved scales, TMA descriptors, and atomic
-// counter once. execute() only resets the counter and launches the kernel.
-// ---------------------------------------------------------------------------
-
-struct Fp4BlkScaledPersistentGemmPlan;
-
-Fp4BlkScaledPersistentGemmPlan* create_fp4_blkscaled_persistent_gemm_plan(
-    const Fp4BlkScaledWeightTensor& A,
-    const Fp4BlkScaledWeightTensor& B,
-    int M, int N, int K,
-    const half* bias = nullptr,
-    Fp4BlkScaledEpilogue epilogue = Fp4BlkScaledEpilogue::NONE
-);
-
-void execute_fp4_blkscaled_persistent_gemm(Fp4BlkScaledPersistentGemmPlan* plan, half* C, cudaStream_t stream = 0);
-
-void destroy_fp4_blkscaled_persistent_gemm_plan(Fp4BlkScaledPersistentGemmPlan* plan);
 
 }  // namespace blaze

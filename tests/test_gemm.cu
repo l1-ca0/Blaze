@@ -11,6 +11,7 @@
 #include "gemm/fp4_gemm_sm100.cuh"
 #include "gemm/fp4_blkscaled_gemm_sm100.cuh"
 #include "gemm/mixed_gemm_sm100.cuh"
+#include "gemm/cublas_gemm.cuh"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -416,10 +417,9 @@ int test_fp4_blkscaled_gemm(cublasHandle_t cublas) {
     return passed == total ? 0 : 1;
 }
 
-// ---------------------------------------------------------------------------
-// FP4 Block-Scaled GEMM (Persistent): same test, using persistent kernel
-// ---------------------------------------------------------------------------
+// (Persistent block-scaled test removed — kernel will be reimplemented as P2)
 
+#if 0  // PERSISTENT KERNEL REMOVED
 int test_fp4_blkscaled_persistent_gemm(cublasHandle_t cublas) {
     printf("\n=== FP4 Block-Scaled Persistent GEMM Tests ===\n");
     int passed = 0;
@@ -515,6 +515,245 @@ int test_fp4_blkscaled_persistent_gemm(cublasHandle_t cublas) {
     printf("  FP4 BlkScaled Persistent GEMM: %d/%d passed\n", passed, total);
     return passed == total ? 0 : 1;
 }
+#endif  // PERSISTENT KERNEL REMOVED
+
+// ---------------------------------------------------------------------------
+// cuBLAS GEMM correctness tests (FP16, FP8, Mixed via cuBLASLt)
+// ---------------------------------------------------------------------------
+
+static void cpu_matmul_f32(const float* A, const float* B, float* C,
+                           int M, int N, int K) {
+    for (int m = 0; m < M; m++)
+        for (int n = 0; n < N; n++) {
+            double sum = 0.0;
+            for (int k = 0; k < K; k++)
+                sum += (double)A[m * K + k] * (double)B[k * N + n];
+            C[m * N + n] = (float)sum;
+        }
+}
+
+struct CublasErrorStats {
+    float max_rel;
+    float mean_rel;
+    int nan_count;
+    int inf_count;
+};
+
+static CublasErrorStats cublas_compute_error(const float* ref, const half* test, int n) {
+    CublasErrorStats s = {0, 0, 0, 0};
+    double sum_rel = 0.0;
+    for (int i = 0; i < n; i++) {
+        float t = __half2float(test[i]);
+        float r = ref[i];
+        if (isnan(t)) { s.nan_count++; continue; }
+        if (isinf(t)) { s.inf_count++; continue; }
+        float abs_err = fabsf(r - t);
+        float denom = fmaxf(fmaxf(fabsf(r), fabsf(t)), 1.0f);
+        float rel_err = abs_err / denom;
+        s.max_rel = fmaxf(s.max_rel, rel_err);
+        sum_rel += rel_err;
+    }
+    s.mean_rel = (float)(sum_rel / n);
+    return s;
+}
+
+static float fp8_to_float_host(__nv_fp8_e4m3 v) { return (float)v; }
+
+static float decode_e2m1_host(uint8_t nibble) {
+    static const float lut[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    float mag = lut[nibble & 0x7];
+    return (nibble & 0x8) ? -mag : mag;
+}
+
+int test_cublas_fp16() {
+    printf("\n=== cuBLAS FP16 GEMM Tests ===\n");
+    int passed = 0;
+    int total = sizeof(llama_shapes) / sizeof(llama_shapes[0]);
+
+    for (int t = 0; t < total; t++) {
+        auto& s = llama_shapes[t];
+        // Skip large shapes for CPU reference (too slow)
+        if ((long long)s.M * s.N * s.K > 500000000LL) {
+            printf("  [%d/%d] %s (M=%d, N=%d, K=%d)... SKIP (too large for CPU ref)\n",
+                   t + 1, total, s.name, s.M, s.N, s.K);
+            passed++;
+            continue;
+        }
+        printf("  [%d/%d] %s (M=%d, N=%d, K=%d)... ",
+               t + 1, total, s.name, s.M, s.N, s.K);
+
+        int sA = s.M * s.K, sB = s.K * s.N, sC = s.M * s.N;
+        auto* h_A = new half[sA];
+        auto* h_B = new half[sB];
+        init_random_fp16(h_A, sA, 42 + t);
+        init_random_fp16(h_B, sB, 123 + t);
+
+        auto* ref_A = new float[sA];
+        auto* ref_B = new float[sB];
+        auto* ref_C = new float[sC];
+        for (int i = 0; i < sA; i++) ref_A[i] = __half2float(h_A[i]);
+        for (int i = 0; i < sB; i++) ref_B[i] = __half2float(h_B[i]);
+        cpu_matmul_f32(ref_A, ref_B, ref_C, s.M, s.N, s.K);
+
+        half *d_A, *d_B, *d_C;
+        CHECK_CUDA(cudaMalloc(&d_A, sA * sizeof(half)));
+        CHECK_CUDA(cudaMalloc(&d_B, sB * sizeof(half)));
+        CHECK_CUDA(cudaMalloc(&d_C, sC * sizeof(half)));
+        CHECK_CUDA(cudaMemcpy(d_A, h_A, sA * sizeof(half), cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpy(d_B, h_B, sB * sizeof(half), cudaMemcpyHostToDevice));
+
+        blaze::cublas_gemm_fp16(d_A, d_B, d_C, s.M, s.N, s.K);
+        CHECK_CUDA(cudaDeviceSynchronize());
+
+        auto* h_C = new half[sC];
+        CHECK_CUDA(cudaMemcpy(h_C, d_C, sC * sizeof(half), cudaMemcpyDeviceToHost));
+        auto err = cublas_compute_error(ref_C, h_C, sC);
+
+        bool ok = (err.nan_count == 0 && err.inf_count == 0 && err.max_rel < 0.05f);
+        printf("%s (max_rel=%.4f, mean_rel=%.6f)\n", ok ? "PASS" : "FAIL",
+               err.max_rel, err.mean_rel);
+        if (ok) passed++;
+
+        delete[] h_A; delete[] h_B; delete[] h_C;
+        delete[] ref_A; delete[] ref_B; delete[] ref_C;
+        cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
+    }
+    printf("  cuBLAS FP16: %d/%d passed\n", passed, total);
+    return passed == total ? 0 : 1;
+}
+
+int test_cublas_fp8() {
+    printf("\n=== cuBLAS FP8 GEMM Tests ===\n");
+    int passed = 0;
+    int total = sizeof(llama_shapes) / sizeof(llama_shapes[0]);
+
+    for (int t = 0; t < total; t++) {
+        auto& s = llama_shapes[t];
+        if ((long long)s.M * s.N * s.K > 500000000LL) {
+            printf("  [%d/%d] %s (M=%d, N=%d, K=%d)... SKIP (too large for CPU ref)\n",
+                   t + 1, total, s.name, s.M, s.N, s.K);
+            passed++;
+            continue;
+        }
+        printf("  [%d/%d] %s (M=%d, N=%d, K=%d)... ",
+               t + 1, total, s.name, s.M, s.N, s.K);
+
+        int sA = s.M * s.K, sB = s.K * s.N, sC = s.M * s.N;
+        auto* h_A = new __nv_fp8_e4m3[sA];
+        auto* h_B = new __nv_fp8_e4m3[sB];
+        init_random_fp8(h_A, sA, 42 + t);
+        init_random_fp8(h_B, sB, 123 + t);
+
+        auto* ref_A = new float[sA];
+        auto* ref_B = new float[sB];
+        auto* ref_C = new float[sC];
+        for (int i = 0; i < sA; i++) ref_A[i] = fp8_to_float_host(h_A[i]);
+        for (int i = 0; i < sB; i++) ref_B[i] = fp8_to_float_host(h_B[i]);
+        cpu_matmul_f32(ref_A, ref_B, ref_C, s.M, s.N, s.K);
+
+        __nv_fp8_e4m3 *d_A, *d_B;
+        half *d_C;
+        CHECK_CUDA(cudaMalloc(&d_A, sA));
+        CHECK_CUDA(cudaMalloc(&d_B, sB));
+        CHECK_CUDA(cudaMalloc(&d_C, sC * sizeof(half)));
+        CHECK_CUDA(cudaMemcpy(d_A, h_A, sA, cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpy(d_B, h_B, sB, cudaMemcpyHostToDevice));
+
+        blaze::cublas_gemm_fp8(d_A, d_B, d_C, s.M, s.N, s.K);
+        CHECK_CUDA(cudaDeviceSynchronize());
+
+        auto* h_C = new half[sC];
+        CHECK_CUDA(cudaMemcpy(h_C, d_C, sC * sizeof(half), cudaMemcpyDeviceToHost));
+        auto err = cublas_compute_error(ref_C, h_C, sC);
+
+        bool ok = (err.nan_count == 0 && err.inf_count == 0 && err.max_rel < 0.10f);
+        printf("%s (max_rel=%.4f, mean_rel=%.6f)\n", ok ? "PASS" : "FAIL",
+               err.max_rel, err.mean_rel);
+        if (ok) passed++;
+
+        delete[] h_A; delete[] h_B; delete[] h_C;
+        delete[] ref_A; delete[] ref_B; delete[] ref_C;
+        cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
+    }
+    printf("  cuBLAS FP8: %d/%d passed\n", passed, total);
+    return passed == total ? 0 : 1;
+}
+
+int test_cublas_mixed() {
+    printf("\n=== cuBLAS Mixed GEMM Tests (FP16 x FP4) ===\n");
+    int passed = 0;
+    int total = sizeof(llama_shapes) / sizeof(llama_shapes[0]);
+
+    for (int t = 0; t < total; t++) {
+        auto& s = llama_shapes[t];
+        if ((long long)s.M * s.N * s.K > 500000000LL) {
+            printf("  [%d/%d] %s (M=%d, N=%d, K=%d)... SKIP (too large for CPU ref)\n",
+                   t + 1, total, s.name, s.M, s.N, s.K);
+            passed++;
+            continue;
+        }
+        printf("  [%d/%d] %s (M=%d, N=%d, K=%d)... ",
+               t + 1, total, s.name, s.M, s.N, s.K);
+
+        int sA = s.M * s.K, sC = s.M * s.N;
+        int data_bytes = s.K * s.N / 2;
+        int scale_count = s.K * (s.N / blaze::FP4_BLOCK_SIZE);
+
+        auto* h_A = new half[sA];
+        init_random_fp16(h_A, sA, 42 + t);
+
+        auto* h_B_data = new uint8_t[data_bytes];
+        auto* h_B_scales = new __nv_fp8_e4m3[scale_count];
+        float tensor_scale = 0.25f;
+        memset(h_B_data, 0x22, data_bytes);  // E2M1 = 1.0
+        for (int i = 0; i < scale_count; i++)
+            h_B_scales[i] = __nv_fp8_e4m3(1.0f);
+
+        // CPU reference
+        auto* ref_A = new float[sA];
+        auto* ref_B = new float[s.K * s.N];
+        auto* ref_C = new float[sC];
+        for (int i = 0; i < sA; i++) ref_A[i] = __half2float(h_A[i]);
+        for (int row = 0; row < s.K; row++)
+            for (int col = 0; col < s.N; col++) {
+                int byte_idx = row * (s.N / 2) + col / 2;
+                uint8_t nibble = (col & 1) ? (h_B_data[byte_idx] >> 4) : (h_B_data[byte_idx] & 0x0F);
+                int si = row * (s.N / blaze::FP4_BLOCK_SIZE) + col / blaze::FP4_BLOCK_SIZE;
+                ref_B[row * s.N + col] = decode_e2m1_host(nibble) * (float)h_B_scales[si] * tensor_scale;
+            }
+        cpu_matmul_f32(ref_A, ref_B, ref_C, s.M, s.N, s.K);
+
+        half *d_A, *d_C;
+        uint8_t* d_B_data;
+        __nv_fp8_e4m3* d_B_scales;
+        CHECK_CUDA(cudaMalloc(&d_A, sA * sizeof(half)));
+        CHECK_CUDA(cudaMalloc(&d_C, sC * sizeof(half)));
+        CHECK_CUDA(cudaMalloc(&d_B_data, data_bytes));
+        CHECK_CUDA(cudaMalloc(&d_B_scales, scale_count * sizeof(__nv_fp8_e4m3)));
+        CHECK_CUDA(cudaMemcpy(d_A, h_A, sA * sizeof(half), cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpy(d_B_data, h_B_data, data_bytes, cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpy(d_B_scales, h_B_scales, scale_count * sizeof(__nv_fp8_e4m3), cudaMemcpyHostToDevice));
+
+        blaze::Fp4WeightTensor B_weight = {d_B_data, d_B_scales, tensor_scale, s.K, s.N};
+        blaze::cublas_gemm_mixed(d_A, B_weight, d_C, s.M, s.N, s.K);
+        CHECK_CUDA(cudaDeviceSynchronize());
+
+        auto* h_C = new half[sC];
+        CHECK_CUDA(cudaMemcpy(h_C, d_C, sC * sizeof(half), cudaMemcpyDeviceToHost));
+        auto err = cublas_compute_error(ref_C, h_C, sC);
+
+        bool ok = (err.nan_count == 0 && err.inf_count == 0 && err.max_rel < 0.05f);
+        printf("%s (max_rel=%.4f, mean_rel=%.6f)\n", ok ? "PASS" : "FAIL",
+               err.max_rel, err.mean_rel);
+        if (ok) passed++;
+
+        delete[] h_A; delete[] h_B_data; delete[] h_B_scales; delete[] h_C;
+        delete[] ref_A; delete[] ref_B; delete[] ref_C;
+        cudaFree(d_A); cudaFree(d_C); cudaFree(d_B_data); cudaFree(d_B_scales);
+    }
+    printf("  cuBLAS Mixed: %d/%d passed\n", passed, total);
+    return passed == total ? 0 : 1;
+}
 
 // ---------------------------------------------------------------------------
 
@@ -524,14 +763,19 @@ int main() {
     cublasHandle_t cublas;
     cublasCreate(&cublas);
     cublasSetMathMode(cublas, CUBLAS_TENSOR_OP_MATH);
+    blaze::cublas_init();
 
     int ret = 0;
     ret |= test_fp8_gemm(cublas);
     ret |= test_mixed_gemm(cublas);
     ret |= test_fp4_gemm(cublas);
     ret |= test_fp4_blkscaled_gemm(cublas);
-    ret |= test_fp4_blkscaled_persistent_gemm(cublas);
+    // Persistent kernel removed — will be reimplemented as P2 with tcgen05.commit
+    ret |= test_cublas_fp16();
+    ret |= test_cublas_fp8();
+    ret |= test_cublas_mixed();
 
+    blaze::cublas_destroy();
     cublasDestroy(cublas);
 
     printf("\n=== Overall: %s ===\n", ret == 0 ? "ALL PASSED" : "SOME FAILED");
