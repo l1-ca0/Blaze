@@ -156,4 +156,90 @@ void execute_fp4_blkscaled_gemm(Fp4BlkScaledGemmPlan* plan, half* C, cudaStream_
 
 void destroy_fp4_blkscaled_gemm_plan(Fp4BlkScaledGemmPlan* plan);
 
+// ===========================================================================
+// Persistent block-scaled kernel with tcgen05.commit
+//
+// Improvements over non-persistent:
+//   - TMEM allocated once at kernel start (512 cols: 2×128 accum + 8 SFA + 8 SFB)
+//   - tcgen05.commit signals MMA completion (no __syncthreads() before epilogue)
+//   - Atomic counter assigns tiles dynamically (replaces static blockIdx)
+//   - Accumulator double-buffering: MMA writes buf A while epilogue reads buf B
+//   - All 4 warps drain accumulator between tiles (tcgen05.ld is warp-scoped)
+//
+// Requires CUDA 13.2+ (tcgen05.commit runtime support).
+// ===========================================================================
+
+struct Fp4BlkScaledP2Config {
+    // Same tile dimensions as non-persistent
+    static constexpr int TILE_M = Fp4BlkScaledConfig::TILE_M;           // 128
+    static constexpr int TILE_N = Fp4BlkScaledConfig::TILE_N;           // 128
+    static constexpr int TILE_K = Fp4BlkScaledConfig::TILE_K;           // 128
+    static constexpr int K_PER_MMA = Fp4BlkScaledConfig::K_PER_MMA;     // 64
+    static constexpr int NUM_K_ITERS = Fp4BlkScaledConfig::NUM_K_ITERS; // 2
+    static constexpr int BLOCK_SIZE = Fp4BlkScaledConfig::BLOCK_SIZE;    // 128
+    static constexpr int PIPELINE_STAGES = Fp4BlkScaledConfig::PIPELINE_STAGES; // 2
+
+    // Reuse scale factor and SMEM constants from non-persistent config
+    static constexpr int SF_VEC_SIZE = Fp4BlkScaledConfig::SF_VEC_SIZE;
+    static constexpr int SF_K = Fp4BlkScaledConfig::SF_K;
+    static constexpr int SF_CP_BYTES_PER_ROW = Fp4BlkScaledConfig::SF_CP_BYTES_PER_ROW;
+    static constexpr int SF_SMEM_ROW_BYTES = Fp4BlkScaledConfig::SF_SMEM_ROW_BYTES;
+    static constexpr int SF_SMEM_ROWS = Fp4BlkScaledConfig::SF_SMEM_ROWS;
+
+    static constexpr int SMEM_A_DATA_BYTES = Fp4BlkScaledConfig::SMEM_A_DATA_BYTES;
+    static constexpr int SMEM_B_DATA_BYTES = Fp4BlkScaledConfig::SMEM_B_DATA_BYTES;
+    static constexpr int SMEM_SFA_BYTES = Fp4BlkScaledConfig::SMEM_SFA_BYTES;
+    static constexpr int SMEM_SFB_BYTES = Fp4BlkScaledConfig::SMEM_SFB_BYTES;
+
+    // TMEM layout: double-buffered accumulators + shared scale columns
+    //   [0,   128)   Accumulator buffer A  (128 cols)
+    //   [128, 256)   Accumulator buffer B  (128 cols)
+    //   [256, 264)   SFA                   (8 cols)
+    //   [264, 272)   SFB                   (8 cols)
+    //   [272, 512)   Unused
+    static constexpr int TMEM_ACCUM_COLS = TILE_N;                       // 128 per buffer
+    static constexpr int TMEM_ACCUM_A_START = 0;
+    static constexpr int TMEM_ACCUM_B_START = TMEM_ACCUM_COLS;           // 128
+    static constexpr int TMEM_SFA_START = 2 * TMEM_ACCUM_COLS;           // 256
+    static constexpr int TMEM_SFB_START = TMEM_SFA_START + Fp4BlkScaledConfig::TMEM_SFA_COLS;  // 264
+    static constexpr int TMEM_ALLOC_COLS = 512;                          // next power-of-2 >= 272
+};
+
+// ---------------------------------------------------------------------------
+// Persistent kernel API
+// ---------------------------------------------------------------------------
+
+/**
+ * Launch persistent block-scaled FP4 GEMM with tcgen05.commit.
+ *
+ * Persistent CTAs loop over tiles via atomic counter scheduling.
+ * TMEM double-buffered: MMA writes buf A while epilogue reads buf B.
+ * tcgen05.commit signals MMA completion without __syncthreads().
+ *
+ * Requires CUDA 13.2+ for tcgen05.commit runtime support.
+ */
+void launch_gemm_fp4_blkscaled_p2(
+    const Fp4BlkScaledWeightTensor& A,
+    const Fp4BlkScaledWeightTensor& B,
+    half* C,
+    int M, int N, int K,
+    const half* bias = nullptr,
+    Fp4BlkScaledEpilogue epilogue = Fp4BlkScaledEpilogue::NONE,
+    cudaStream_t stream = 0
+);
+
+struct Fp4BlkScaledP2GemmPlan;
+
+Fp4BlkScaledP2GemmPlan* create_fp4_blkscaled_p2_gemm_plan(
+    const Fp4BlkScaledWeightTensor& A,
+    const Fp4BlkScaledWeightTensor& B,
+    int M, int N, int K,
+    const half* bias = nullptr,
+    Fp4BlkScaledEpilogue epilogue = Fp4BlkScaledEpilogue::NONE
+);
+
+void execute_fp4_blkscaled_p2_gemm(Fp4BlkScaledP2GemmPlan* plan, half* C, cudaStream_t stream = 0);
+
+void destroy_fp4_blkscaled_p2_gemm_plan(Fp4BlkScaledP2GemmPlan* plan);
+
 }  // namespace blaze

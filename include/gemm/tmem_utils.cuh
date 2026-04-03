@@ -243,7 +243,7 @@ __device__ __forceinline__
 void tcgen05_commit(uint64_t* mbar_smem) {
     uint32_t mbar_addr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar_smem));
     asm volatile(
-        "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cta.b64 [%0];\n"
+        "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];\n"
         : : "r"(mbar_addr) : "memory"
     );
 }
@@ -271,13 +271,13 @@ void tcgen05_commit(uint64_t* mbar_smem) {
  * @param cta_mask       Bitmask of CTAs in cluster participating (0x1 for 1×1×1)
  */
 __device__ __forceinline__
-void clc_try_cancel(void* smem_response, uint64_t* mbar_smem, uint32_t cta_mask) {
+void clc_try_cancel(void* smem_response, uint64_t* mbar_smem, uint16_t cta_mask) {
     uint32_t resp_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_response));
     uint32_t mbar_addr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar_smem));
     asm volatile(
         "clusterlaunchcontrol.try_cancel.async.shared::cta.mbarrier::complete_tx::bytes.b128 "
         "[%0], [%1], %2;\n"
-        : : "r"(resp_addr), "r"(mbar_addr), "r"(cta_mask) : "memory"
+        : : "r"(resp_addr), "r"(mbar_addr), "h"(cta_mask) : "memory"
     );
 }
 

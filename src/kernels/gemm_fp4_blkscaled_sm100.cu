@@ -328,7 +328,7 @@ void fp4_blkscaled_epilogue(
     }
 }
 
-// (Persistent kernel removed — will be reimplemented as P2 with tcgen05.commit)
+// (Old persistent kernel removed — superseded by commit-based version below)
 
 
 // ---------------------------------------------------------------------------
@@ -654,5 +654,591 @@ void destroy_fp4_blkscaled_gemm_plan(Fp4BlkScaledGemmPlan* plan) {
     delete plan;
 }
 
+// ===========================================================================
+// Persistent kernel with tcgen05.commit + TMEM double-buffering
+// ===========================================================================
+
+using P2Config = Fp4BlkScaledP2Config;
+
+// --- Persistent SMEM layout ---
+
+struct __align__(128) Fp4BlkScaledSmemP2 {
+    // SMEM data pipeline barriers
+    alignas(8) uint64_t mbar_load[P2Config::PIPELINE_STAGES];   // TMA → MMA (init=2)
+    alignas(8) uint64_t mbar_mma[P2Config::PIPELINE_STAGES];    // MMA → TMA (init=1)
+
+    // Accumulator pipeline barriers (commit → epilogue)
+    alignas(8) uint64_t mbar_accum[2];    // tcgen05.commit → epilogue (init=1)
+
+    // Shared state
+    uint32_t tmem_addr;
+    int tile_linear_id;                    // atomic counter result
+
+    // Pad header to 128 bytes for TMA alignment
+    // Fields: 4×8(mbar_load/mma) + 2×8(mbar_accum) + 4+4(shared) = 56 bytes
+    char _pad[128 - 56];
+
+    // Double-buffered data tiles (same as non-persistent)
+    uint8_t A_data[P2Config::PIPELINE_STAGES][P2Config::SMEM_A_DATA_BYTES];
+    uint8_t B_data[P2Config::PIPELINE_STAGES][P2Config::SMEM_B_DATA_BYTES];
+    uint8_t SFA[P2Config::PIPELINE_STAGES][P2Config::SMEM_SFA_BYTES];
+    uint8_t SFB[P2Config::PIPELINE_STAGES][P2Config::SMEM_SFB_BYTES];
+};
+
+// --- Persistent TMA producers (cumulative phase tracking across tiles) ---
+
+__device__ __forceinline__
+void fp4_p2_tma_producer_a(
+    Fp4BlkScaledSmemP2* smem,
+    const TmaDescriptor* desc_A_data,
+    const TmaDescriptor* desc_SFA,
+    int bm, int K, int lane_id,
+    int k_tile_base              // cumulative K-tile offset across all tiles
+) {
+    static constexpr uint32_t TX_BYTES = P2Config::SMEM_A_DATA_BYTES
+                                       + P2Config::SMEM_SFA_BYTES;
+    const int num_k_tiles = K / P2Config::TILE_K;
+
+    for (int k_tile = 0; k_tile < num_k_tiles; k_tile++) {
+        int global_k = k_tile_base + k_tile;
+        int stage = global_k % P2Config::PIPELINE_STAGES;
+        int k_offset = k_tile * P2Config::TILE_K;
+
+        // Wait for consumer to release this stage. Skip for very first
+        // PIPELINE_STAGES iterations ever (barriers freshly initialized).
+        if (global_k >= P2Config::PIPELINE_STAGES) {
+            mbarrier_wait(&smem->mbar_mma[stage],
+                         ((global_k / P2Config::PIPELINE_STAGES) + 1) & 1);
+        }
+
+        if (lane_id == 0) {
+            mbarrier_expect_tx(&smem->mbar_load[stage], TX_BYTES);
+            tma_load_2d(smem->A_data[stage], desc_A_data,
+                        k_offset / 2, bm, &smem->mbar_load[stage]);
+            tma_load_2d(smem->SFA[stage], desc_SFA,
+                        k_offset / 4, bm / 4, &smem->mbar_load[stage]);
+        }
+    }
+}
+
+__device__ __forceinline__
+void fp4_p2_tma_producer_b(
+    Fp4BlkScaledSmemP2* smem,
+    const TmaDescriptor* desc_B_data,
+    const TmaDescriptor* desc_SFB,
+    int bn, int K, int lane_id,
+    int k_tile_base
+) {
+    static constexpr uint32_t TX_BYTES = P2Config::SMEM_B_DATA_BYTES
+                                       + P2Config::SMEM_SFB_BYTES;
+    const int num_k_tiles = K / P2Config::TILE_K;
+
+    for (int k_tile = 0; k_tile < num_k_tiles; k_tile++) {
+        int global_k = k_tile_base + k_tile;
+        int stage = global_k % P2Config::PIPELINE_STAGES;
+        int k_offset = k_tile * P2Config::TILE_K;
+
+        if (global_k >= P2Config::PIPELINE_STAGES) {
+            mbarrier_wait(&smem->mbar_mma[stage],
+                         ((global_k / P2Config::PIPELINE_STAGES) + 1) & 1);
+        }
+
+        if (lane_id == 0) {
+            mbarrier_expect_tx(&smem->mbar_load[stage], TX_BYTES);
+            tma_load_2d(smem->B_data[stage], desc_B_data,
+                        bn / 2, k_offset, &smem->mbar_load[stage]);
+            tma_load_2d(smem->SFB[stage], desc_SFB,
+                        k_offset / 4, bn / 4, &smem->mbar_load[stage]);
+        }
+    }
+}
+
+// --- MMA consumer with tcgen05.commit (cumulative phase tracking) ---
+
+__device__ __forceinline__
+void fp4_p2_mma_consumer(
+    Fp4BlkScaledSmemP2* smem,
+    tmem_addr_t tmem_base,
+    tmem_addr_t tmem_sfa,
+    tmem_addr_t tmem_sfb,
+    int K,
+    int acc_buf,
+    int k_tile_base              // cumulative K-tile offset across all tiles
+) {
+    const int num_k_tiles = K / P2Config::TILE_K;
+    bool first_mma = true;
+
+    tmem_addr_t accum_addr = tmem_base + acc_buf * P2Config::TMEM_ACCUM_COLS;
+
+    uint32_t idesc = make_idesc_blkscaled(
+        5, 5, P2Config::TILE_M, P2Config::TILE_N, 0, 0);
+
+    for (int k_tile = 0; k_tile < num_k_tiles; k_tile++) {
+        int global_k = k_tile_base + k_tile;
+        int stage = global_k % P2Config::PIPELINE_STAGES;
+
+        // Wait for TMA loads
+        mbarrier_wait(&smem->mbar_load[stage],
+                     (global_k / P2Config::PIPELINE_STAGES) & 1);
+
+        asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+        asm volatile("tcgen05.fence::after_thread_sync;\n" ::: "memory");
+
+        // tcgen05.cp: copy scales from SMEM → TMEM
+        {
+            uint32_t sfa_smem = static_cast<uint32_t>(
+                __cvta_generic_to_shared(smem->SFA[stage]));
+            uint32_t sfb_smem = static_cast<uint32_t>(
+                __cvta_generic_to_shared(smem->SFB[stage]));
+
+            for (int ki = 0; ki < P2Config::NUM_K_ITERS; ki++) {
+                uint64_t sfa_desc = make_sf_smem_desc(
+                    sfa_smem + ki * P2Config::SF_CP_BYTES_PER_ROW,
+                    P2Config::SF_SMEM_ROW_BYTES);
+                tcgen05_cp_32x128b_warpx4(tmem_sfa + ki * 4, sfa_desc);
+
+                uint64_t sfb_desc = make_sf_smem_desc(
+                    sfb_smem + ki * P2Config::SF_CP_BYTES_PER_ROW,
+                    P2Config::SF_SMEM_ROW_BYTES);
+                tcgen05_cp_32x128b_warpx4(tmem_sfb + ki * 4, sfb_desc);
+            }
+        }
+
+        // MMA inner loop
+        uint32_t smem_a_base = static_cast<uint32_t>(
+            __cvta_generic_to_shared(smem->A_data[stage]));
+        uint32_t smem_b_base = static_cast<uint32_t>(
+            __cvta_generic_to_shared(smem->B_data[stage]));
+
+        for (int ki = 0; ki < P2Config::NUM_K_ITERS; ki++) {
+            uint32_t smem_a = smem_a_base + ki * (P2Config::K_PER_MMA / 2);
+            uint32_t smem_b = smem_b_base + ki * (P2Config::K_PER_MMA / 2) * (P2Config::TILE_N / 2);
+
+            uint64_t desc_a = make_smem_desc(smem_a, P2Config::TILE_K / 2, 4);
+            uint64_t desc_b = make_smem_desc(smem_b, P2Config::TILE_N / 2, 4);
+
+            if (elect_one_sync()) {
+                blkscaled_mma_mxf4nvf4(
+                    accum_addr, desc_a, desc_b, idesc,
+                    tmem_sfa + ki * 4,
+                    tmem_sfb + ki * 4,
+                    !first_mma
+                );
+            }
+            first_mma = false;
+        }
+
+        asm volatile("tcgen05.fence::before_thread_sync;\n" ::: "memory");
+
+        __syncwarp();
+        if (elect_one_sync()) {
+            mbarrier_arrive(&smem->mbar_mma[stage]);
+        }
+    }
+
+    // Signal MMA completion via tcgen05.commit
+    if (elect_one_sync()) {
+        tcgen05_commit(&smem->mbar_accum[acc_buf]);
+    }
+}
+
+// --- Persistent kernel entry point ---
+//
+// Optimized persistent loop:
+//   - No per-tile barrier reinit (cumulative phase tracking across tiles)
+//   - Epilogue drain uses per-warp fence only (no __syncthreads)
+//   - Tile claim overlapped with epilogue (warp 0 claims while warps finish reads)
+//   - TMA loads start during epilogue drain (warps 1-2 begin next tile's loads
+//     while warps 0,3 finish writing previous tile's results to global memory)
+
+__cluster_dims__(1, 1, 1)
+__global__ void __launch_bounds__(P2Config::BLOCK_SIZE)
+gemm_fp4_blkscaled_p2_kernel(
+    const TmaDescriptor* __restrict__ desc_A_data,
+    const TmaDescriptor* __restrict__ desc_B_data,
+    const TmaDescriptor* __restrict__ desc_SFA,
+    const TmaDescriptor* __restrict__ desc_SFB,
+    half* __restrict__ C,
+    int M, int N, int K,
+    float tensor_scale_A, float tensor_scale_B,
+    const half* __restrict__ bias,
+    Fp4BlkScaledEpilogue epilogue_op,
+    int* tile_counter,
+    int total_tiles,
+    int grid_n
+) {
+    extern __shared__ char smem_raw[];
+    auto* smem = reinterpret_cast<Fp4BlkScaledSmemP2*>(smem_raw);
+
+    const int tid = threadIdx.x;
+    const int warp_id = tid / 32;
+    const int lane_id = tid % 32;
+    const int num_k_tiles_per_output = K / P2Config::TILE_K;
+
+    // === One-time initialization ===
+    if (tid == 0) {
+        for (int s = 0; s < P2Config::PIPELINE_STAGES; s++) {
+            mbarrier_inval(&smem->mbar_load[s]);
+            mbarrier_inval(&smem->mbar_mma[s]);
+        }
+        for (int s = 0; s < P2Config::PIPELINE_STAGES; s++) {
+            mbarrier_init(&smem->mbar_load[s], 2);
+            mbarrier_init(&smem->mbar_mma[s], 1);
+        }
+        mbarrier_init(&smem->mbar_accum[0], 1);
+        mbarrier_init(&smem->mbar_accum[1], 1);
+    }
+    __syncthreads();
+
+    tmem_addr_t tmem_base;
+    if (warp_id == 0) {
+        tmem_alloc(&smem->tmem_addr, P2Config::TMEM_ALLOC_COLS);
+    }
+    __syncthreads();
+    tmem_base = smem->tmem_addr;
+
+    tmem_addr_t tmem_sfa = tmem_base + P2Config::TMEM_SFA_START;
+    tmem_addr_t tmem_sfb = tmem_base + P2Config::TMEM_SFB_START;
+
+    int acc_buf = 0;
+    int prev_buf = -1;
+    int prev_bm = 0, prev_bn = 0;
+    int k_tile_total = 0;        // cumulative K-tiles across all output tiles
+    int buf_use_count[2] = {0, 0};
+
+    // Claim first tile
+    if (tid == 0) {
+        smem->tile_linear_id = atomicAdd(tile_counter, 1);
+    }
+    __syncthreads();
+
+    // === Persistent tile loop ===
+    for (;;) {
+        int linear_id = smem->tile_linear_id;
+        if (linear_id >= total_tiles) break;
+
+        int bm = (linear_id / grid_n) * P2Config::TILE_M;
+        int bn = (linear_id % grid_n) * P2Config::TILE_N;
+
+        // --- Mainloop (warp 0 = MMA, warps 1-2 = TMA, warp 3 = idle) ---
+        switch (warp_id) {
+            case 0:
+                fp4_p2_mma_consumer(smem, tmem_base, tmem_sfa, tmem_sfb,
+                                    K, acc_buf, k_tile_total);
+                break;
+            case 1:
+                fp4_p2_tma_producer_a(smem, desc_A_data, desc_SFA,
+                                      bm, K, lane_id, k_tile_total);
+                break;
+            case 2:
+                fp4_p2_tma_producer_b(smem, desc_B_data, desc_SFB,
+                                      bn, K, lane_id, k_tile_total);
+                break;
+            default: break;
+        }
+
+        k_tile_total += num_k_tiles_per_output;
+        buf_use_count[acc_buf]++;
+        prev_buf = acc_buf;
+        prev_bm = bm;
+        prev_bn = bn;
+        acc_buf ^= 1;
+
+        // --- Drain previous tile + claim next tile (overlapped) ---
+        // Warp 0 claims next tile while all warps drain the accumulator.
+        // No __syncthreads() needed — commit signals when accumulator is ready,
+        // and the fence ensures TMEM reads complete before next MMA writes.
+
+        // Wait for MMA commit
+        int drain_phase = (buf_use_count[prev_buf] - 1) & 1;
+        mbarrier_wait(&smem->mbar_accum[prev_buf], drain_phase);
+
+        // Claim next tile (warp 0 only, overlapped with TMEM reads below)
+        if (warp_id == 0 && lane_id == 0) {
+            smem->tile_linear_id = atomicAdd(tile_counter, 1);
+        }
+
+        // All warps: read their 32-row TMEM slice → global store
+        {
+            tmem_addr_t accum_addr = tmem_base + prev_buf * P2Config::TMEM_ACCUM_COLS;
+            fp4_blkscaled_epilogue(accum_addr, C, prev_bm, prev_bn, M, N,
+                                   tensor_scale_A, tensor_scale_B,
+                                   bias, epilogue_op, warp_id, lane_id);
+        }
+
+        // Per-warp fence: ensure this warp's TMEM reads are done
+        asm volatile("tcgen05.fence::before_thread_sync;\n" ::: "memory");
+
+        // Sync: all warps must finish epilogue before next tile's MMA can
+        // overwrite the accumulator buffer (prev_buf will be reused 2 tiles later)
+        __syncthreads();
+    }
+
+    // === Drain last tile's accumulator ===
+    if (prev_buf >= 0) {
+        int drain_phase = (buf_use_count[prev_buf] - 1) & 1;
+        mbarrier_wait(&smem->mbar_accum[prev_buf], drain_phase);
+
+        tmem_addr_t accum_addr = tmem_base + prev_buf * P2Config::TMEM_ACCUM_COLS;
+        fp4_blkscaled_epilogue(accum_addr, C, prev_bm, prev_bn, M, N,
+                               tensor_scale_A, tensor_scale_B,
+                               bias, epilogue_op, warp_id, lane_id);
+    }
+
+    // === Cleanup ===
+    __syncthreads();
+    if (warp_id == 0) {
+        tmem_dealloc(tmem_base, P2Config::TMEM_ALLOC_COLS);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Persistent kernel host launch
+// ---------------------------------------------------------------------------
+
+void launch_gemm_fp4_blkscaled_p2(
+    const Fp4BlkScaledWeightTensor& A,
+    const Fp4BlkScaledWeightTensor& B,
+    half* C,
+    int M, int N, int K,
+    const half* bias,
+    Fp4BlkScaledEpilogue epilogue,
+    cudaStream_t stream
+) {
+    // Interleave scales (same pattern as non-persistent kernel)
+    int sf_k = K / Config::SF_VEC_SIZE;  // scales along K
+    int sf_cols = sf_k * 4;              // = K/4 (interleaved SfAtom width)
+    int sfb_rows = N / 4;
+
+    // Handle M < TILE_M by padding to TILE_M
+    int M_pad = (M < P2Config::TILE_M) ? P2Config::TILE_M : M;
+    int sfa_rows_pad = M_pad / 4;
+
+    uint8_t *sfa_interleaved, *sfb_interleaved;
+    cudaMalloc(&sfa_interleaved, (size_t)sfa_rows_pad * sf_cols);
+    cudaMalloc(&sfb_interleaved, (size_t)sfb_rows * sf_cols);
+    cudaMemsetAsync(sfa_interleaved, 0, (size_t)sfa_rows_pad * sf_cols, stream);
+    cudaMemsetAsync(sfb_interleaved, 0, (size_t)sfb_rows * sf_cols, stream);
+
+    // SFA interleave: src [M, sf_k] row-major
+    {
+        int blocks = (M + 127) / 128;
+        interleave_scales_kernel<<<blocks, 128, 0, stream>>>(
+            A.block_scales, sfa_interleaved, M, sf_k);
+    }
+    // SFB interleave: src [sf_k, N] row-major, interleave over N
+    {
+        int blocks = (N + 127) / 128;
+        interleave_scales_transposed_kernel<<<blocks, 128, 0, stream>>>(
+            B.block_scales, sfb_interleaved, N, sf_k, N);
+    }
+
+    // A data padding (if M < TILE_M)
+    uint8_t* A_data_padded = nullptr;
+    const uint8_t* A_data_ptr = A.data;
+    if (M < P2Config::TILE_M) {
+        size_t data_bytes = (size_t)M_pad * K / 2;
+        cudaMalloc(&A_data_padded, data_bytes);
+        cudaMemsetAsync(A_data_padded, 0, data_bytes, stream);
+        cudaMemcpyAsync(A_data_padded, A.data, (size_t)M * K / 2,
+                        cudaMemcpyDeviceToDevice, stream);
+        A_data_ptr = A_data_padded;
+    }
+
+    // TMA descriptors (same as non-persistent kernel)
+    TmaDescriptor h_descs[4];
+    create_tma_desc_2d(&h_descs[0], A_data_ptr, CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                       M_pad, K / 2, P2Config::TILE_M, P2Config::TILE_K / 2, TmaSwizzle::B64);
+    create_tma_desc_2d(&h_descs[1], B.data, CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                       K, N / 2, P2Config::TILE_K, P2Config::TILE_N / 2, TmaSwizzle::B64);
+    create_tma_desc_2d(&h_descs[2], sfa_interleaved, CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                       sfa_rows_pad, sf_cols, 32, P2Config::TILE_K / 4, TmaSwizzle::NONE);
+    create_tma_desc_2d(&h_descs[3], sfb_interleaved, CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                       sfb_rows, sf_cols, 32, P2Config::TILE_K / 4, TmaSwizzle::NONE);
+
+    TmaDescriptor* d_descs;
+    cudaMalloc(&d_descs, 4 * sizeof(TmaDescriptor));
+    cudaMemcpyAsync(d_descs, h_descs, 4 * sizeof(TmaDescriptor),
+                    cudaMemcpyHostToDevice, stream);
+
+    // Grid: persistent — one CTA per SM
+    int num_sms = 0;
+    cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, 0);
+    int grid_m = (M + P2Config::TILE_M - 1) / P2Config::TILE_M;
+    int grid_n = (N + P2Config::TILE_N - 1) / P2Config::TILE_N;
+    int total_tiles = grid_m * grid_n;
+    int grid_x = min(num_sms, total_tiles);  // Don't launch more CTAs than tiles
+
+    size_t smem_size = sizeof(Fp4BlkScaledSmemP2);
+    cudaFuncSetAttribute(gemm_fp4_blkscaled_p2_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+
+    cudaLaunchConfig_t launch_config = {};
+    launch_config.gridDim = dim3(grid_x);
+    launch_config.blockDim = dim3(P2Config::BLOCK_SIZE);
+    launch_config.dynamicSmemBytes = smem_size;
+    launch_config.stream = stream;
+
+    cudaLaunchAttribute launch_attrs[1];
+    launch_attrs[0].id = cudaLaunchAttributeClusterDimension;
+    launch_attrs[0].val.clusterDim.x = 1;
+    launch_attrs[0].val.clusterDim.y = 1;
+    launch_attrs[0].val.clusterDim.z = 1;
+    launch_config.attrs = launch_attrs;
+    launch_config.numAttrs = 1;
+
+    // Atomic tile counter (reset to 0 each launch)
+    int* d_tile_counter;
+    cudaMalloc(&d_tile_counter, sizeof(int));
+    cudaMemsetAsync(d_tile_counter, 0, sizeof(int), stream);
+
+    cudaLaunchKernelEx(&launch_config, gemm_fp4_blkscaled_p2_kernel,
+        d_descs + 0, d_descs + 1, d_descs + 2, d_descs + 3,
+        C, M, N, K,
+        A.tensor_scale, B.tensor_scale,
+        bias, epilogue, d_tile_counter, total_tiles, grid_n);
+
+    cudaStreamSynchronize(stream);
+    cudaFree(d_tile_counter);
+    if (A_data_padded) cudaFree(A_data_padded);
+    cudaFree(sfa_interleaved);
+    cudaFree(sfb_interleaved);
+    cudaFree(d_descs);
+}
+
+// ---------------------------------------------------------------------------
+// Persistent kernel prepare/execute API
+// ---------------------------------------------------------------------------
+
+struct Fp4BlkScaledP2GemmPlan {
+    uint8_t* A_data_padded;
+    uint8_t* sfa_interleaved;
+    uint8_t* sfb_interleaved;
+    TmaDescriptor* d_descs;
+    int* d_tile_counter;       // Atomic tile counter (reset each execute)
+
+    float tensor_scale_A, tensor_scale_B;
+    const half* bias;
+    Fp4BlkScaledEpilogue epilogue;
+
+    dim3 grid, block;
+    size_t smem_size;
+    int M, N, K;
+    int total_tiles, grid_n;
+};
+
+Fp4BlkScaledP2GemmPlan* create_fp4_blkscaled_p2_gemm_plan(
+    const Fp4BlkScaledWeightTensor& A,
+    const Fp4BlkScaledWeightTensor& B,
+    int M, int N, int K,
+    const half* bias,
+    Fp4BlkScaledEpilogue epilogue
+) {
+    auto* plan = new Fp4BlkScaledP2GemmPlan();
+    plan->M = M; plan->N = N; plan->K = K;
+    plan->tensor_scale_A = A.tensor_scale;
+    plan->tensor_scale_B = B.tensor_scale;
+    plan->bias = bias;
+    plan->epilogue = epilogue;
+    plan->A_data_padded = nullptr;
+
+    // Interleave scales (same pattern as non-persistent)
+    int sf_k = K / Config::SF_VEC_SIZE;
+    int sf_cols = sf_k * 4;
+    int sfb_rows = N / 4;
+    int M_pad = (M < P2Config::TILE_M) ? P2Config::TILE_M : M;
+    int sfa_rows_pad = M_pad / 4;
+
+    cudaMalloc(&plan->sfa_interleaved, (size_t)sfa_rows_pad * sf_cols);
+    cudaMalloc(&plan->sfb_interleaved, (size_t)sfb_rows * sf_cols);
+    cudaMemset(plan->sfa_interleaved, 0, (size_t)sfa_rows_pad * sf_cols);
+    cudaMemset(plan->sfb_interleaved, 0, (size_t)sfb_rows * sf_cols);
+
+    interleave_scales_kernel<<<(M + 127) / 128, 128>>>(
+        A.block_scales, plan->sfa_interleaved, M, sf_k);
+    interleave_scales_transposed_kernel<<<(N + 127) / 128, 128>>>(
+        B.block_scales, plan->sfb_interleaved, N, sf_k, N);
+    cudaDeviceSynchronize();
+
+    // A data padding
+    const uint8_t* A_data_ptr = A.data;
+    if (M < P2Config::TILE_M) {
+        size_t data_bytes = (size_t)M_pad * K / 2;
+        cudaMalloc(&plan->A_data_padded, data_bytes);
+        cudaMemset(plan->A_data_padded, 0, data_bytes);
+        cudaMemcpy(plan->A_data_padded, A.data, (size_t)M * K / 2, cudaMemcpyDeviceToDevice);
+        A_data_ptr = plan->A_data_padded;
+    }
+
+    // TMA descriptors
+    TmaDescriptor h_descs[4];
+    create_tma_desc_2d(&h_descs[0], A_data_ptr, CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                       M_pad, K / 2, P2Config::TILE_M, P2Config::TILE_K / 2, TmaSwizzle::B64);
+    create_tma_desc_2d(&h_descs[1], B.data, CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                       K, N / 2, P2Config::TILE_K, P2Config::TILE_N / 2, TmaSwizzle::B64);
+    create_tma_desc_2d(&h_descs[2], plan->sfa_interleaved, CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                       sfa_rows_pad, sf_cols, 32, P2Config::TILE_K / 4, TmaSwizzle::NONE);
+    create_tma_desc_2d(&h_descs[3], plan->sfb_interleaved, CU_TENSOR_MAP_DATA_TYPE_UINT8,
+                       sfb_rows, sf_cols, 32, P2Config::TILE_K / 4, TmaSwizzle::NONE);
+
+    cudaMalloc(&plan->d_descs, 4 * sizeof(TmaDescriptor));
+    cudaMemcpy(plan->d_descs, h_descs, 4 * sizeof(TmaDescriptor), cudaMemcpyHostToDevice);
+
+    // Grid
+    int num_sms = 0;
+    cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, 0);
+    plan->grid_n = (N + P2Config::TILE_N - 1) / P2Config::TILE_N;
+    int grid_m = (M + P2Config::TILE_M - 1) / P2Config::TILE_M;
+    plan->total_tiles = grid_m * plan->grid_n;
+    int grid_x = min(num_sms, plan->total_tiles);
+
+    plan->grid = dim3(grid_x);
+    plan->block = dim3(P2Config::BLOCK_SIZE);
+    plan->smem_size = sizeof(Fp4BlkScaledSmemP2);
+
+    cudaFuncSetAttribute(gemm_fp4_blkscaled_p2_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, plan->smem_size);
+
+    // Atomic tile counter
+    cudaMalloc(&plan->d_tile_counter, sizeof(int));
+
+    return plan;
+}
+
+void execute_fp4_blkscaled_p2_gemm(Fp4BlkScaledP2GemmPlan* plan, half* C, cudaStream_t stream) {
+    // Reset tile counter for each execution
+    cudaMemsetAsync(plan->d_tile_counter, 0, sizeof(int), stream);
+    cudaLaunchConfig_t launch_config = {};
+    launch_config.gridDim = plan->grid;
+    launch_config.blockDim = plan->block;
+    launch_config.dynamicSmemBytes = plan->smem_size;
+    launch_config.stream = stream;
+
+    cudaLaunchAttribute launch_attrs[1];
+    launch_attrs[0].id = cudaLaunchAttributeClusterDimension;
+    launch_attrs[0].val.clusterDim.x = 1;
+    launch_attrs[0].val.clusterDim.y = 1;
+    launch_attrs[0].val.clusterDim.z = 1;
+    launch_config.attrs = launch_attrs;
+    launch_config.numAttrs = 1;
+
+    cudaLaunchKernelEx(&launch_config, gemm_fp4_blkscaled_p2_kernel,
+        plan->d_descs + 0, plan->d_descs + 1,
+        plan->d_descs + 2, plan->d_descs + 3,
+        C, plan->M, plan->N, plan->K,
+        plan->tensor_scale_A, plan->tensor_scale_B,
+        plan->bias, plan->epilogue,
+        plan->d_tile_counter, plan->total_tiles, plan->grid_n);
+}
+
+void destroy_fp4_blkscaled_p2_gemm_plan(Fp4BlkScaledP2GemmPlan* plan) {
+    if (!plan) return;
+    if (plan->A_data_padded) cudaFree(plan->A_data_padded);
+    if (plan->sfa_interleaved) cudaFree(plan->sfa_interleaved);
+    if (plan->sfb_interleaved) cudaFree(plan->sfb_interleaved);
+    if (plan->d_descs) cudaFree(plan->d_descs);
+    if (plan->d_tile_counter) cudaFree(plan->d_tile_counter);
+    delete plan;
+}
 
 }  // namespace blaze
